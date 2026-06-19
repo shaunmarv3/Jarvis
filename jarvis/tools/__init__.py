@@ -17,8 +17,10 @@ from langchain_core.tools import tool
 from .arxiv_tool import arxiv_fetch, arxiv_search
 from .crossref import crossref_resolve
 from .datasets import dataset_search
+from .hf_inspect import dataset_inspect
 from .openalex import openalex_search
 from .semantic_scholar import s2_resolve_title, s2_search
+from .web import web_read, web_search
 
 # name -> raw structured callable (executed by the graph's act node)
 TOOL_FUNCS = {
@@ -29,6 +31,9 @@ TOOL_FUNCS = {
     "search_openalex": openalex_search,
     "resolve_doi": crossref_resolve,
     "search_datasets": dataset_search,
+    "inspect_dataset": dataset_inspect,
+    "search_web": web_search,
+    "read_web": web_read,
 }
 
 
@@ -74,6 +79,26 @@ def search_datasets(query: str, max_results: int = 6) -> str:
     return dataset_search(query, max_results)["text"]
 
 
+@tool
+def inspect_dataset(dataset: str) -> str:
+    """Inspect a HuggingFace dataset (columns, row count, sample rows, README) without downloading it.
+
+    `dataset` is a hub id like 'squad' or 'rajpurkar/squad_v2'."""
+    return dataset_inspect(dataset)["text"]
+
+
+@tool
+def search_web(query: str, max_results: int = 6) -> str:
+    """Search the open web (DuckDuckGo) for non-academic info, news, blogs, docs."""
+    return web_search(query, max_results)["text"]
+
+
+@tool
+def read_web(url: str) -> str:
+    """Fetch a web page and return its main readable text content."""
+    return web_read(url)["text"]
+
+
 TOOL_SCHEMAS = [
     search_arxiv,
     fetch_arxiv,
@@ -82,6 +107,9 @@ TOOL_SCHEMAS = [
     search_openalex,
     resolve_doi,
     search_datasets,
+    inspect_dataset,
+    search_web,
+    read_web,
 ]
 
 __all__ = ["TOOL_FUNCS", "TOOL_SCHEMAS"]

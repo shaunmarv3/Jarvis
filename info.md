@@ -284,5 +284,64 @@ Static banner fallback:
 
 ---
 
+## 14. Phase 2 — implemented & verified (2026-06-19)
+
+Everything below is built and tested working end-to-end.
+
+### New capabilities
+- **Chat-with-paper (RAG), per-paper isolated stores** — `/read N` parses the PDF, summarizes
+  (map-reduce), **saves the summary** to `data/summaries/`, and **indexes the full text into its OWN
+  vector folder** `data/vectorstore/<slug>__<HHMMSSmmm>/` (one Chroma collection per paper), embedded
+  by local **`nomic-embed-text`** (768-dim). A `registry.json` maps folder ↔ paper. `/db` lists the
+  library, `/use N` selects a paper, `/ask <q>` answers scoped to ONE paper (picker if none selected,
+  so content never mixes), `/forget N` deletes a paper's vectors (gc + retry to beat Windows file
+  locks). Files: `embeddings.py`, `store.py`, `qa.py`. *Verified:* two papers → two separate
+  timestamped folders, isolated search, scoped /ask correct, delete removes folder + registry entry.
+- **Dataset inspection (no download)** — `tools/hf_inspect.py` via the free HF **datasets-server**:
+  `/info` (columns+types), `/size` (row counts), `/first-rows` (samples), plus README from the Hub.
+  Auto-resolves renamed/bare ids (e.g. `squad` → `rajpurkar/squad`). CLI: `/inspect <id>`, `/dataset <q>`.
+  *Verified:* `rajpurkar/squad` → 5 columns, ~98,169 rows (train 87,599 / val 10,570), sample rows.
+- **Web research** — `tools/web.py`: **`ddgs`** (DuckDuckGo search, free, no key) + **`trafilatura`**
+  (clean article-text extraction). CLI: `/web <q>`; agent tools `search_web`, `read_web`.
+  *Verified:* 3 hits + extracted 12.6K chars of clean text.
+- **Relevance filter** — `embeddings.rank_by_relevance()` ranks gathered papers by cosine similarity
+  to the brief and drops off-topic ones (`relevance_min=0.25`, keep top `keep_top_papers=12`). Fixes
+  the earlier "tangential NLP papers" noise.
+- **Live tool view** — the act node records each `tool(args)` call; the CLI streams them
+  (`→ search_arxiv(query=…)`) like Claude Code.
+- **Persistence** — summaries → `data/summaries/`, reports → `data/reports/` (timestamped).
+
+### Key decisions & learnings (important)
+- **qwen3.5 is a reasoning model.** Without caps it emits huge hidden "thinking" chains → calls take
+  minutes / appear to hang. **Fix in `llm.py`:** `reasoning=False`, `num_predict=1024`, `num_ctx=8192`,
+  and a hard `client_kwargs={"timeout": 180}` so a wedged call can't hang forever. `max_loops` lowered
+  to 3. (The original 2-hour "hang" was the PC sleeping mid-run, but these caps are essential anyway.)
+- **Scrapling was dropped from the default.** v0.4.x hard-imports **Playwright** (a full browser) even
+  for static fetches — defeating the "lightweight, no-browser" goal. So the default web stack is
+  **ddgs + trafilatura** (no browser). Scrapling remains *optional*: set `USE_SCRAPLING=true` and
+  install `scrapling` + `curl_cffi` + `playwright` to enable the stealth fetch path in `web.py`.
+- **crawl4ai** was considered and rejected for the same Playwright-weight reason; trafilatura is the
+  better fit for *reading* research pages.
+- **HF dataset ids get renamed** — always resolve via `is-valid` / Hub search before hitting the API.
+
+### New dependencies (added to `requirements.txt`)
+`ddgs`, `trafilatura`, `langchain-chroma`, `chromadb`. Optional (commented): `scrapling`, `curl_cffi`.
+Embeddings reuse `langchain-ollama` (`OllamaEmbeddings`).
+
+### Packaging & git hygiene (2026-06-19)
+- **`jarvis` command** — `pyproject.toml` defines a console entry point `jarvis = jarvis.cli:main`;
+  run `pip install -e .` to register it. **`jarvis.bat`** (calls `.venv\Scripts\python.exe -m jarvis`)
+  lets you run `jarvis` from any cmd window without activating the venv — put the folder on PATH.
+- **`.gitignore`** now ignores `.venv/`, `data/`, `.env`, `__pycache__/`, `*.pyc`, build/editor cruft.
+  The repo had accidentally committed the entire `.venv` (~12k files); untracked via
+  `git rm -r --cached .venv data` + pyc cleanup → 23 clean source files tracked. `data/` (PDFs,
+  vectors, reports) is intentionally not committed.
+
+### Phase 3 ideas (not built)
+Chat across *all* saved papers at once; Streamlit UI; Kaggle search; citation-graph exploration;
+enable the Scrapling/Playwright booster.
+
+---
+
 *The detailed implementation plan also lives at*
 `C:\Users\SHAUN RODRIGUES\.claude\plans\shimmying-swimming-mountain.md`.

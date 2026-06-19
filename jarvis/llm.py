@@ -46,9 +46,18 @@ def get_llm(backend: str | None = None, temperature: float = 0.3, **kwargs):
 
     from langchain_ollama import ChatOllama
 
-    return ChatOllama(
+    num_predict = kwargs.pop("num_predict", settings.ollama_num_predict)
+    params = dict(
         model=settings.ollama_model,
         base_url=settings.ollama_base_url,
         temperature=temperature,
+        num_predict=num_predict,
+        num_ctx=settings.ollama_num_ctx,
+        client_kwargs={"timeout": settings.ollama_timeout},
         **kwargs,
     )
+    # `reasoning` exists only on newer langchain-ollama; degrade gracefully.
+    try:
+        return ChatOllama(reasoning=settings.ollama_reasoning, **params)
+    except TypeError:
+        return ChatOllama(**params)

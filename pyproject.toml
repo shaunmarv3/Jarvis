@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-research-agent"
+version = "0.2.0"
+description = "Personal AI research agent in the terminal (LangGraph + Ollama/DeepSeek)"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[project.scripts]
+jarvis = "jarvis.cli:main"
+
+[tool.setuptools]
+packages = ["jarvis", "jarvis.tools"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

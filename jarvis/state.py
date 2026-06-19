@@ -17,6 +17,9 @@ class AgentState(TypedDict, total=False):
     queries: list  # all queries issued so far
     papers: list  # accumulated paper dicts
     datasets: list  # accumulated dataset dicts
+    web: list  # accumulated web hits
+    last_evidence: str  # raw tool output text from the most recent act step
+    last_tools: list  # "name(args)" strings the agent called this step (for live view)
     findings: str  # running synthesis
     gaps: str  # open knowledge gaps from the last reflect
     complete: bool  # reflect decided we're done

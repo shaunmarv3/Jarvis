@@ -30,10 +30,17 @@ _NODE_LABELS = {
 }
 
 _HELP = """[bold cyan]Commands[/]
-  [green]<free text>[/]              ask the agent (it plans, confirms, then researches)
-  [green]/read <N>[/]                download & summarize result N
+  [green]<free text>[/]              research anything (plans, confirms, then searches)
+  [green]/read <N>[/]                download, summarize & index paper N into its own vector store
+  [green]/db[/]                      list papers in the vector DB (each stored separately)
+  [green]/ask <question>[/]          ask a question; pick which indexed paper to query (no mixing)
+  [green]/use <N>[/]                 select DB paper N as the target for /ask
+  [green]/forget <N>[/]              delete DB paper N's vectors
   [green]/save <N>[/]                download paper N's PDF to data/papers
-  [green]/papers[/]                  list this session's papers
+  [green]/papers[/]                  list this session's search results
+  [green]/dataset <query>[/]         search HuggingFace + Papers with Code datasets
+  [green]/inspect <hub_id>[/]        inspect a dataset (cols, rows, sample, README) — e.g. /inspect squad
+  [green]/web <query>[/]             quick web search (DuckDuckGo)
   [green]/backend ollama|deepseek[/] switch the LLM brain
   [green]/model <name>[/]            switch the Ollama model
   [green]/help[/]                    show this help
@@ -53,7 +60,9 @@ def _drive(graph, payload, config):
             if label:
                 console.print(f"[dim]· {label}[/]")
             if node == "act" and isinstance(update, dict):
-                console.print(f"[dim]  ↳ {len(update.get('papers', []))} papers so far[/]")
+                for call in update.get("last_tools", []) or []:
+                    console.print(f"[dim]  → [cyan]{call}[/][/]")
+                console.print(f"[dim]  ↳ {len(update.get('papers', []))} papers kept[/]")
             if node == "reflect" and isinstance(update, dict):
                 if update.get("complete"):
                     console.print("[dim]  ↳ enough gathered[/]")
@@ -119,15 +128,122 @@ def _show_papers(papers: list[dict]) -> None:
     console.print(table)
 
 
-def _read_paper(papers: list[dict], idx: int) -> None:
+def _read_paper(papers: list[dict], idx: int) -> tuple[dict, str] | None:
+    """Summarize paper #idx, persist summary, index into its OWN store. Returns (paper, folder)."""
     if not (1 <= idx <= len(papers)):
         console.print(f"[red]no paper #{idx}[/] (have {len(papers)})")
-        return
+        return None
     paper = papers[idx - 1]
     console.print(f"[dim]reading: {paper.get('title')} …[/]")
     with console.status("[cyan]downloading & summarizing…[/]"):
         out = summarize_paper(paper, backend=active_backend())
     console.print(Panel(Markdown(out["text"]), border_style="blue"))
+
+    # Persist summary + index full text into a dedicated vector folder.
+    from .qa import ensure_indexed, save_summary
+
+    try:
+        spath = save_summary(paper, out["text"])
+        console.print(f"[dim]summary saved → {spath}[/]")
+    except Exception as exc:
+        console.print(f"[yellow]could not save summary: {exc}[/]")
+    with console.status("[cyan]indexing for /ask…[/]"):
+        ok, note, folder = ensure_indexed(paper)
+    if ok:
+        console.print(f"[dim]· {note} → folder [cyan]{folder}[/] — now [green]/ask <question>[/][/]")
+        return paper, folder
+    console.print(f"[yellow]{note}[/]")
+    return None
+
+
+def _list_db(select: bool = False) -> str | None:
+    """Show the vectorized-paper library. If select, prompt for one and return its folder."""
+    from .store import list_papers
+
+    papers = list_papers()
+    if not papers:
+        console.print("[dim]no papers in the vector DB yet — /read one first[/]")
+        return None
+    table = Table(show_header=True, header_style="bold cyan", box=None)
+    table.add_column("#", justify="right")
+    table.add_column("title")
+    table.add_column("indexed")
+    table.add_column("chunks", justify="right")
+    table.add_column("folder")
+    for i, e in enumerate(papers, 1):
+        table.add_row(
+            str(i), truncate(e.get("title", "") or e["folder"], 48),
+            (e.get("created_at", "") or "").replace("T", " ")[5:], str(e.get("chunks", "")),
+            truncate(e["folder"], 34),
+        )
+    console.print(table)
+    if not select:
+        return None
+    ans = Prompt.ask("[bold]ask which paper #?[/] [dim](enter to cancel)[/]", default="")
+    if ans.isdigit() and 1 <= int(ans) <= len(papers):
+        return papers[int(ans) - 1]["folder"]
+    return None
+
+
+def _ask(folder: str | None, question: str) -> str | None:
+    """Answer a question against ONE paper's store. Returns the folder used."""
+    from .store import list_papers
+    from .qa import ask_folder
+
+    # If no paper selected, let the user pick from the library (no mixing).
+    if not folder:
+        papers = list_papers()
+        if not papers:
+            console.print("[yellow]no papers indexed — /read one first[/]")
+            return None
+        if len(papers) == 1:
+            folder = papers[0]["folder"]
+        else:
+            folder = _list_db(select=True)
+            if not folder:
+                return None
+
+    title = next((e["title"] for e in list_papers() if e["folder"] == folder), folder)
+    with console.status("[cyan]thinking…[/]"):
+        answer, docs = ask_folder(question, folder, backend=active_backend())
+    console.print(Panel(Markdown(answer), title=f"[bold]Q&A · {truncate(title, 50)}[/]", border_style="magenta"))
+    return folder
+
+
+def _forget(idx: int) -> None:
+    from .store import delete_paper, list_papers
+
+    papers = list_papers()
+    if not (1 <= idx <= len(papers)):
+        console.print(f"[red]no DB paper #{idx}[/]")
+        return
+    e = papers[idx - 1]
+    ok = delete_paper(e["folder"])
+    console.print(f"[green]deleted[/] {truncate(e.get('title', ''), 50)}" if ok else "[yellow]nothing removed[/]")
+
+
+def _search_datasets_cmd(query: str) -> None:
+    from .tools.datasets import dataset_search
+
+    with console.status("[cyan]searching datasets…[/]"):
+        out = dataset_search(query)
+    console.print(Panel(out["text"], title="[bold]datasets[/]", border_style="cyan"))
+
+
+def _inspect_dataset_cmd(hub_id: str) -> None:
+    from .tools.hf_inspect import dataset_inspect
+
+    with console.status(f"[cyan]inspecting {hub_id}…[/]"):
+        out = dataset_inspect(hub_id)
+    console.print(Panel(out["text"], title=f"[bold]{hub_id}[/]", border_style="cyan"))
+
+
+def _web_cmd(query: str) -> None:
+    from .tools.web import web_search
+
+    with console.status("[cyan]searching the web…[/]"):
+        out = web_search(query)
+    console.print(Panel(out["text"], title="[bold]web[/]", border_style="cyan"))
 
 
 def _save_paper(papers: list[dict], idx: int) -> None:
@@ -144,12 +260,25 @@ def _save_paper(papers: list[dict], idx: int) -> None:
 
 
 def main() -> None:
+    # Force UTF-8 so the ASCII banner / box-drawing chars never hit a cp1252 crash on Windows.
+    import sys
+
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     set_active_backend(settings.default_backend)
-    console.clear()
-    render_banner(console, active_backend(), settings.ollama_model)
+    try:
+        console.clear()
+        render_banner(console, active_backend(), settings.ollama_model)
+    except Exception:
+        console.print("[bold cyan]J A R V I S[/] — personal research agent")
 
     graph = build_graph()
     session_papers: list[dict] = []
+    current_folder: str | None = None  # active paper's vector folder, target of /ask
 
     while True:
         try:
@@ -174,9 +303,53 @@ def main() -> None:
                 _show_papers(session_papers)
             elif cmd == "/read":
                 if arg.isdigit():
-                    _read_paper(session_papers, int(arg))
+                    res = _read_paper(session_papers, int(arg))
+                    if res:
+                        current_folder = res[1]
                 else:
                     console.print("[red]usage: /read <N>[/]")
+            elif cmd == "/db":
+                _list_db()
+            elif cmd == "/ask":
+                if arg:
+                    used = _ask(current_folder, arg)
+                    if used:
+                        current_folder = used
+                else:
+                    console.print("[red]usage: /ask <question>[/]")
+            elif cmd == "/use":
+                if arg.isdigit():
+                    from .store import list_papers
+
+                    papers_db = list_papers()
+                    if 1 <= int(arg) <= len(papers_db):
+                        current_folder = papers_db[int(arg) - 1]["folder"]
+                        console.print(f"[green]active paper → {truncate(papers_db[int(arg) - 1]['title'], 50)}[/]")
+                    else:
+                        console.print(f"[red]no DB paper #{arg}[/]")
+                else:
+                    console.print("[red]usage: /use <N>[/]")
+            elif cmd == "/forget":
+                if arg.isdigit():
+                    _forget(int(arg))
+                    current_folder = None
+                else:
+                    console.print("[red]usage: /forget <N>[/]")
+            elif cmd == "/dataset":
+                if arg:
+                    _search_datasets_cmd(arg)
+                else:
+                    console.print("[red]usage: /dataset <query>[/]")
+            elif cmd == "/inspect":
+                if arg:
+                    _inspect_dataset_cmd(arg)
+                else:
+                    console.print("[red]usage: /inspect <hub_id>[/]")
+            elif cmd == "/web":
+                if arg:
+                    _web_cmd(arg)
+                else:
+                    console.print("[red]usage: /web <query>[/]")
             elif cmd == "/save":
                 if arg.isdigit():
                     _save_paper(session_papers, int(arg))

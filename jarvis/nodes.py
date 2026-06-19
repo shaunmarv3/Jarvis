@@ -6,6 +6,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import interrupt
 
 from .config import settings
+from .embeddings import rank_by_relevance
 from .llm import get_llm
 from .prompts import (
     ACT_SYSTEM,
@@ -24,6 +25,7 @@ _FALLBACK = {
     "find_datasets": ["search_datasets"],
     "pull_exact": ["resolve_title", "search_arxiv"],
     "read": ["resolve_title", "search_arxiv"],
+    "general": ["search_web", "search_arxiv"],
 }
 _DEFAULT_FALLBACK = ["search_arxiv", "search_semantic_scholar", "search_openalex"]
 
@@ -114,21 +116,41 @@ def act_node(state: AgentState) -> dict:
 
     new_papers: list[dict] = []
     new_datasets: list[dict] = []
+    new_web: list[dict] = []
     summaries: list[str] = []
+    called: list[str] = []
     for tc in tool_calls:
-        out = _run_tool(tc["name"], tc.get("args") or {})
+        args = tc.get("args") or {}
+        called.append(f"{tc['name']}({', '.join(f'{k}={truncate(str(v), 40)}' for k, v in args.items())})")
+        out = _run_tool(tc["name"], args)
         new_papers.extend(out.get("papers", []) or [])
         new_datasets.extend(out.get("datasets", []) or [])
+        new_web.extend(out.get("web", []) or [])
         summaries.append(out.get("text", ""))
 
     papers = dedup_papers(list(state.get("papers", [])) + new_papers)
+    # Relevance filter: rank against the focused user query (not the verbose brief,
+    # which can inflate scores of tangential papers) and drop off-topic noise.
+    ranked = rank_by_relevance(
+        f"{state.get('query', '')} {state.get('current_query', '')}".strip(),
+        papers,
+        top_k=settings.keep_top_papers,
+        min_score=settings.relevance_min,
+    )
+    # Never let the filter wipe everything out if scores run low.
+    if not ranked and papers:
+        ranked = papers[: settings.keep_top_papers]
     datasets = state.get("datasets", []) + [
         d for d in new_datasets if d not in state.get("datasets", [])
     ]
+    evidence = "\n\n".join(s for s in summaries if s)[:6000]
     return {
-        "papers": papers,
+        "papers": ranked,
         "datasets": datasets,
-        "messages": [AIMessage(content="\n\n".join(s for s in summaries if s)[:6000])],
+        "web": state.get("web", []) + new_web,
+        "last_evidence": evidence,
+        "last_tools": called,
+        "messages": [AIMessage(content=evidence)],
     }
 
 
@@ -138,6 +160,10 @@ def synthesize_node(state: AgentState) -> dict:
         f"- {p.get('title')} ({p.get('year')}): {truncate(p.get('abstract', ''), 240)}"
         for p in papers[-10:]
     ) or "(no papers yet)"
+    # Include non-paper evidence (web pages, dataset inspections) from this step.
+    evidence = state.get("last_evidence", "")
+    if evidence:
+        material += "\n\nOther evidence gathered:\n" + truncate(evidence, 2500)
 
     llm = get_llm(state.get("backend"), temperature=0.3)
     try:
@@ -221,6 +247,21 @@ def finalize_node(state: AgentState) -> dict:
             f"Findings:\n{state.get('findings', '')}\n\n"
             f"Papers:\n{_format_papers(state.get('papers', []))}"
         )
+
+    # Persist the report to disk.
+    try:
+        import re
+        from datetime import datetime
+
+        from .config import REPORTS_DIR
+
+        slug = re.sub(r"[^a-z0-9]+", "-", (state.get("query", "report")).lower())[:50].strip("-")
+        path = REPORTS_DIR / f"{datetime.now():%Y%m%d-%H%M%S}-{slug}.md"
+        path.write_text(report, encoding="utf-8")
+        report += f"\n\n_(saved to {path})_"
+    except Exception:
+        pass
+
     return {"report": report, "messages": [AIMessage(content=report)]}
 
 

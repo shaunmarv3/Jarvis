@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Local data (PDFs, summaries, reports, vector DB, caches)
+data/
+
+# Secrets / local config
+.env
+
+# Editor / OS
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+info.md
