@@ -14,7 +14,13 @@ def _hf_search(query: str, limit: int) -> list[dict]:
 
         api = HfApi()
         out = []
-        for d in api.list_datasets(search=query, limit=limit, sort="downloads", direction=-1):
+        # Newer huggingface_hub dropped the `direction` kwarg (sort="downloads" is
+        # already descending). Keep a fallback so either version works.
+        try:
+            hits = api.list_datasets(search=query, limit=limit, sort="downloads")
+        except TypeError:
+            hits = api.list_datasets(search=query, limit=limit)
+        for d in hits:
             out.append(
                 {
                     "source": "huggingface",

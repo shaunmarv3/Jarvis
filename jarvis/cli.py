@@ -13,40 +13,37 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from .banner import render_banner
-from .config import settings
+from .config import settings, subagent_ceiling
 from .graph import build_graph
 from .llm import active_backend, resolve_backend, set_active_backend
+from .repl import COMMANDS, read_line, set_session_papers_getter
 from .tools.pdf_reader import summarize_paper
 from .utils import truncate
 
 console = Console()
 
 _NODE_LABELS = {
-    "clarify": "🧭 understanding your request",
-    "plan": "🧠 lead agent planning subagents",
-    "fanout": "🔎 subagents researching",
-    "synthesize": "📝 merging subagent findings",
-    "finalize": "📄 compiling report",
-    "cite": "🔗 attaching citations",
+    "clarify": " understanding your request",
+    "plan": " lead agent planning subagents",
+    "fanout": " subagents researching",
+    "synthesize": " merging subagent findings",
+    "finalize": " compiling report",
+    "cite": " attaching citations",
 }
 
-_HELP = """[bold cyan]Commands[/]
-  [green]<free text>[/]              research anything (plans, confirms, then searches)
-  [green]/read <N>[/]                download, summarize & index paper N into its own vector store
-  [green]/db[/]                      list papers in the vector DB (each stored separately)
-  [green]/ask <question>[/]          ask a question; pick which indexed paper to query (no mixing)
-  [green]/use <N>[/]                 select DB paper N as the target for /ask
-  [green]/forget <N>[/]              delete DB paper N's vectors
-  [green]/save <N>[/]                download paper N's PDF to data/papers
-  [green]/papers[/]                  list this session's search results
-  [green]/dataset <query>[/]         search HuggingFace + Papers with Code datasets
-  [green]/inspect <hub_id>[/]        inspect a dataset (cols, rows, sample, README) — e.g. /inspect squad
-  [green]/web <query>[/]             quick web search (DuckDuckGo)
-  [green]/backend ollama|deepseek[/] switch the LLM brain
-  [green]/model <name>[/]            switch the Ollama model
-  [green]/help[/]                    show this help
-  [green]/quit[/]                    exit
-"""
+def _build_help() -> str:
+    """Build the /help text from the same COMMANDS list that powers the live dropdown."""
+    rows = [
+        "[bold cyan]Commands[/]  [dim](type / for live suggestions)[/]",
+        f"  [green]{'<free text>'.ljust(22)}[/] research anything (plans, confirms, then searches)",
+    ]
+    for name, hint, desc in COMMANDS:
+        left = (f"{name} {hint}".strip()).ljust(22)
+        rows.append(f"  [green]{left}[/] {desc}")
+    return "\n".join(rows)
+
+
+_HELP = _build_help()
 
 
 def _drive(graph, payload, config):
@@ -263,20 +260,6 @@ def _save_paper(papers: list[dict], idx: int) -> None:
         console.print("[yellow]no downloadable PDF for that paper[/]")
 
 
-def _read_line(prompt: str) -> str:
-    """Read a REPL line, stripping a leading BOM that Windows PowerShell prepends
-    when piping stdin. The BOM arrives as U+FEFF if stdin is UTF-8, or as its
-    cp1252 mojibake (\\xef\\xbb\\xbf) if stdin fell back to cp1252 — handle both.
-    `chr()` keeps the markers out of the source as fragile literal bytes.
-    """
-    raw = Prompt.ask(prompt)
-    for bom in (chr(0xFEFF), chr(0xEF) + chr(0xBB) + chr(0xBF)):
-        if raw.startswith(bom):
-            raw = raw[len(bom):]
-            break
-    return raw.strip()
-
-
 def main() -> None:
     # Force UTF-8 so the ASCII banner / box-drawing chars never hit a cp1252 crash on Windows.
     import sys
@@ -302,10 +285,12 @@ def main() -> None:
     graph = build_graph()
     session_papers: list[dict] = []
     current_folder: str | None = None  # active paper's vector folder, target of /ask
+    # Let the /save & /read dropdowns list the current search results (closure sees reassignments).
+    set_session_papers_getter(lambda: session_papers)
 
     while True:
         try:
-            line = _read_line("\n[bold cyan]jarvis[/]")
+            line = read_line()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]bye 👋[/]")
             break
@@ -335,11 +320,25 @@ def main() -> None:
                 _list_db()
             elif cmd == "/ask":
                 if arg:
-                    used = _ask(current_folder, arg)
-                    if used:
-                        current_folder = used
+                    # Optional leading paper number (from the dropdown): "/ask 2 <question>".
+                    folder, question = current_folder, arg
+                    toks = arg.split(maxsplit=1)
+                    if toks[0].isdigit():
+                        from .store import list_papers
+
+                        dbp = list_papers()
+                        n = int(toks[0])
+                        if 1 <= n <= len(dbp):
+                            folder = dbp[n - 1]["folder"]
+                            question = toks[1] if len(toks) > 1 else ""
+                    if not question.strip():
+                        console.print("[yellow]add a question: /ask <N> <question>[/]")
+                    else:
+                        used = _ask(folder, question)  # picker still kicks in if folder is None
+                        if used:
+                            current_folder = used
                 else:
-                    console.print("[red]usage: /ask <question>[/]")
+                    console.print("[red]usage: /ask <question>  (or /ask <N> <question>)[/]")
             elif cmd == "/use":
                 if arg.isdigit():
                     from .store import list_papers
@@ -381,8 +380,12 @@ def main() -> None:
             elif cmd == "/backend":
                 if arg.lower() in {"ollama", "deepseek"}:
                     set_active_backend(arg.lower())
-                    _, notice = resolve_backend()
-                    console.print(f"[green]backend → {active_backend()}[/]")
+                    eff, notice = resolve_backend()  # effective backend (may fall back)
+                    mode = "parallel" if eff == "deepseek" else "sequential"
+                    console.print(
+                        f"[green]backend → {eff}[/] "
+                        f"[dim]· up to {subagent_ceiling(eff)} subagents ({mode})[/]"
+                    )
                     if notice:
                         console.print(f"[yellow]{notice}[/]")
                 else:

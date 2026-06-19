@@ -159,6 +159,9 @@ Python directly, so you don't need to activate the venv first.
 | `/help`                       | Show commands                                                |
 | `/quit`                       | Exit                                                         |
 
+> 💡 Type `/` and a **live dropdown** of commands appears below the cursor (with descriptions),
+> filtered as you type — like Claude Code. Powered by `prompt_toolkit`.
+
 ## Tools & data sources
 
 | Source                                                                         | Use                               | Cost         |
@@ -192,7 +195,8 @@ jarvis/
 │   ├── prompts.py         # prompt templates
 │   ├── tools/             # arxiv, semantic_scholar, openalex, crossref,
 │   │                      #   pdf_reader, datasets, hf_inspect, web
-│   ├── banner.py          # JARVIS ASCII banner
+│   ├── banner.py          # JARVIS ASCII banner (holographic gradient)
+│   ├── repl.py            # prompt_toolkit input + live /command dropdown
 │   └── cli.py             # Rich REPL
 ├── data/                  # git-ignored
 │   ├── papers/            # downloaded PDFs

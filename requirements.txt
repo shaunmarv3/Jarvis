@@ -9,6 +9,7 @@ pymupdf4llm>=0.0.17
 huggingface_hub>=0.25.0
 pydantic-settings>=2.4.0
 rich>=13.7.0
+prompt_toolkit>=3.0.0
 pyfiglet>=1.0.2
 python-dotenv>=1.0.0
 ddgs>=6.0.0

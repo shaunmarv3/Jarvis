@@ -408,12 +408,33 @@ sharper follow-up query, round 2 = narrowed. Then it writes a <150-word briefing
 ### New config (`.env`)
 `MAX_SUBAGENTS_OLLAMA=5`, `MAX_SUBAGENTS_DEEPSEEK=10`, `SUBAGENT_ROUNDS=2`, `PARALLEL_SUBAGENTS=true`.
 
+### CLI polish (2026-06-20)
+- **Holographic banner** (`banner.py`) — per-row vertical gradient (cyan→sky→violet) over the
+  pyfiglet art, the "Just A Rather Very Intelligent System" acronym easter egg, and a live status
+  line showing a backend dot + model + `⚡ N subagents` (N from `subagent_ceiling(backend)`, so it
+  reads 5 on Ollama / 10 on DeepSeek). `/backend` now also prints the new ceiling + exec mode.
+- **Live `/command` dropdown** (`repl.py`, new dep `prompt_toolkit`) — a Claude-Code-style completion
+  menu appears below the cursor as you type `/`, filtered live, each entry showing its arg-hint +
+  description. Only completes the first token; free text and post-command args get no menu. Driven by
+  a single `COMMANDS` list that also generates `/help` (so they never drift). Non-interactive/piped
+  stdin falls back to a plain BOM-stripped read, so scripts and `… | jarvis` still work.
+
 ### Verification (2026-06-19)
 Headless `scripts/smoke.py` (capped to 2 subagents × 1 round) on Ollama/`qwen3.5:9b`: all 7 nodes ran
 in order (clarify→plan→confirm→fanout→synthesize→finalize→cite), **12 on-topic RAG-evaluation papers**
 gathered across subagents and relevance-filtered, and the **CitationAgent produced a report with real
 bracketed `[1]`–`[12]` citations** tied to actual arXiv/Semantic-Scholar links (Ragas [2], FAIR-RAG
 [10], medicine benchmark [4], XRAG [12]). Exit 0. Report saved to `data/reports/`.
+
+### Bug fixed during command testing (2026-06-20)
+- **`/dataset` returned 0 results for everything.** `huggingface_hub` removed the `direction=` kwarg
+  from `list_datasets()`, so `_hf_search` raised `TypeError` on every call and the silent `except`
+  returned `[]`. Fixed in `tools/datasets.py` (drop `direction`, with a version fallback). **Papers
+  with Code's public API is permanently down** (Meta sunset it — now serves non-JSON), so it always
+  returns `[]`; HF is the live source and `/dataset` degrades to HF-only gracefully.
+- Full command sweep (`scripts/test_commands.py`): **26 PASS / 0 FAIL** — dropdown (command + arg
+  completion with real DB/session data), `/papers /db /save /backend /model /web /dataset /inspect`,
+  `/ask` retrieval + full RAG answer, `/forget`.
 
 ### Gotchas confirmed
 - **Slow ≠ hang.** On a 4GB GPU each `qwen3.5:9b` call with `num_predict=1024` is slow (heavy CPU
