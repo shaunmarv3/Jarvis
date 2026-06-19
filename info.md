@@ -5,7 +5,8 @@
 > every tool, the prompts, the gotchas, and the research that grounds the design. If you (or a future
 > session) read only one file, read this one.
 >
-> **Status:** Planned & documented. No code written yet (only `README.md` + this `info.md`).
+> **Status:** Built & verified through **Phase 3** (multi-agent orchestrator-worker). See §14 (Phase 2)
+> and §15 (Phase 3) for what's implemented; §1–§13 capture the original vision & plan.
 > **Date started:** 2026-06-18 / 2026-06-19.
 > **Owner:** Shaun (hobby project).
 
@@ -337,9 +338,94 @@ Embeddings reuse `langchain-ollama` (`OllamaEmbeddings`).
   `git rm -r --cached .venv data` + pyc cleanup → 23 clean source files tracked. `data/` (PDFs,
   vectors, reports) is intentionally not committed.
 
-### Phase 3 ideas (not built)
+### Phase 3 ideas (not built at the time)
 Chat across *all* saved papers at once; Streamlit UI; Kaggle search; citation-graph exploration;
-enable the Scrapling/Playwright booster.
+enable the Scrapling/Playwright booster. **Multi-agent supervisor → built in §15.**
+
+---
+
+## 15. Phase 3 — Multi-agent orchestrator-worker (implemented & verified 2026-06-19)
+
+**This supersedes the single-agent reflect loop described in §4.** Jarvis now follows the
+orchestrator-worker pattern from Anthropic's *[How we built our multi-agent research
+system](https://www.anthropic.com/engineering/multi-agent-research-system)*.
+
+### Architecture (new graph)
+```
+  clarify ─► plan(lead) ─► confirm(human) ──edit──► plan        (re-plan on edit)
+                               │ go
+                               ▼
+                    ┌── subagent 1 (own context + tools) ──┐
+                    ├── subagent 2 (own context + tools) ──┤─► synthesize ─► finalize ─► cite ─► END
+                    └── subagent N (own context + tools) ──┘    (merge)       (draft)   (sources)
+```
+- **`plan` (lead agent)** — decomposes the confirmed brief into independent subagent specs
+  `{objective, sub_query, tools}`. **Count scales to complexity** (1 for a fact, 2-3 for a
+  comparison, more for a survey), bounded by a backend-dependent ceiling.
+- **`confirm`** — human-in-the-loop. Shows the brief **and the subagent split**; "go" proceeds,
+  any other text edits the brief and routes back to `plan` (re-plan + re-confirm). `after_confirm`
+  is the conditional edge.
+- **`fanout`** — runs the subagents. **Backend-aware execution:** sequential `for` loop on Ollama
+  (one GPU), `ThreadPoolExecutor` on DeepSeek (true parallel API calls). Aggregates every subagent's
+  papers/datasets/web, dedups, applies the cosine relevance filter against the original query.
+- **`synthesize`** — lead merges the subagent briefings into one synthesis (`MERGE_PROMPT`).
+- **`finalize`** — drafts the markdown report (TL;DR / key papers / datasets / next steps).
+- **`cite` (CitationAgent)** — rewrites the draft so claims carry bracketed `[n]` citations tied to
+  the **real** retrieved sources, appends a sources list, then persists to `data/reports/`.
+
+### The reflective loop moved *inside* the subagent (`subagent.py`)
+Each subagent has its **own context window** (its own message list) and runs `subagent_rounds`
+broad→narrow rounds: round 1 = the lead's `sub_query` (broad), then a lightweight reflect picks a
+sharper follow-up query, round 2 = narrowed. Then it writes a <150-word briefing. Isolated contexts
+= no topic-bleed between facets (a key reason the article uses subagents).
+
+### Backend-aware execution (the 4GB-GPU reality)
+- **Ollama (RTX 3050 4GB):** subagents run **sequentially** — only one model is in VRAM at a time, so
+  the subagent ceiling is a *patience* limit, not a memory limit. Forcing true-parallel here would
+  thrash (the 9B model already spills to RAM).
+- **DeepSeek:** subagents run **in parallel** (threads over blocking API calls) — same code path,
+  same result quality, just faster wall-clock. This is the one branch that differs by backend.
+- `config.subagent_ceiling(backend)` returns `MAX_SUBAGENTS_DEEPSEEK` (10) or `MAX_SUBAGENTS_OLLAMA` (5).
+
+### Which article principles we applied vs. skipped
+- **Applied:** orchestrator-worker decomposition; isolated subagent contexts; scale-effort-to-complexity
+  (dynamic count); explicit delegation struct per subagent (objective + query + tools + boundaries);
+  broad→narrow search; dedicated citation pass; tightened tool intent in prompts.
+- **Skipped (deliberately, single-user hobby tool):** production async orchestration, "rainbow
+  deployments", crash/state recovery beyond the existing `MemorySaver`; parallel *tool* calls *within*
+  a subagent on Ollama (no benefit on 4GB); the LLM-judge eval harness (deferred to Phase 4).
+
+### New / changed files
+- **New:** `subagent.py` (isolated research loop), `events.py` (progress sink so deep nodes stream
+  live to the CLI without importing Rich), prompts `PLAN_PROMPT` / `SUBAGENT_SYSTEM` / `SUBAGENT_USER`
+  / `SUBAGENT_REFLECT` / `SUBAGENT_SYNTH` / `MERGE_PROMPT` / `CITE_PROMPT`.
+- **Changed:** `nodes.py` (plan/confirm/fanout/synthesize/finalize/cite, dropped act/reflect),
+  `graph.py` (rewired, linear top-level + confirm↻plan branch), `state.py` (+`plan`,
+  `subagent_reports`, `replan`, `max_subagents`), `config.py` (+subagent settings + `subagent_ceiling()`),
+  `cli.py` (shows the plan at confirm, streams subagent progress via the events sink),
+  `scripts/demo_verbose.py` (new node names).
+
+### New config (`.env`)
+`MAX_SUBAGENTS_OLLAMA=5`, `MAX_SUBAGENTS_DEEPSEEK=10`, `SUBAGENT_ROUNDS=2`, `PARALLEL_SUBAGENTS=true`.
+
+### Verification (2026-06-19)
+Headless `scripts/smoke.py` (capped to 2 subagents × 1 round) on Ollama/`qwen3.5:9b`: all 7 nodes ran
+in order (clarify→plan→confirm→fanout→synthesize→finalize→cite), **12 on-topic RAG-evaluation papers**
+gathered across subagents and relevance-filtered, and the **CitationAgent produced a report with real
+bracketed `[1]`–`[12]` citations** tied to actual arXiv/Semantic-Scholar links (Ragas [2], FAIR-RAG
+[10], medicine benchmark [4], XRAG [12]). Exit 0. Report saved to `data/reports/`.
+
+### Gotchas confirmed
+- **Slow ≠ hang.** On a 4GB GPU each `qwen3.5:9b` call with `num_predict=1024` is slow (heavy CPU
+  offload) — a full multi-agent run is several minutes. The per-call `timeout=180` guarantees no
+  single call wedges the run. Use DeepSeek (parallel) when you want speed.
+- **PowerShell pipe prepends a UTF-8 BOM to stdin.** `"/help" | jarvis` sent the command as
+  `<BOM>/help`, so `startswith("/")` failed and it was treated as a research query. Worse, with
+  `sys.stdin` on cp1252 the BOM decodes to the 3-char mojibake `ï»¿` (U+00EF/BB/BF), not a single
+  U+FEFF. Fix in `cli.py`: reconfigure **stdin** (not just stdout/stderr) to UTF-8 **and** a
+  `_read_line()` helper that strips a leading BOM in *both* forms (using `chr()` so no fragile literal
+  bytes live in the source). Interactive typing is unaffected (no BOM → passthrough). Verified: piped
+  `/help` and `/db` now parse as commands.
 
 ---
 

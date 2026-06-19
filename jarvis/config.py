@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     contact_email: str = "research@example.com"
     request_timeout: int = 30
 
+    # Multi-agent (orchestrator-worker, per Anthropic's research-system design).
+    # The lead agent spawns subagents up to a ceiling that depends on the backend:
+    # one local GPU runs them sequentially (a patience limit), the cloud runs them
+    # in parallel (just API calls), so the cloud ceiling is higher.
+    max_subagents_ollama: int = 5  # ceiling on local Ollama (subagents run sequentially)
+    max_subagents_deepseek: int = 10  # ceiling on DeepSeek (subagents run in parallel)
+    subagent_rounds: int = 2  # search rounds per subagent (broad query -> narrowed follow-up)
+    parallel_subagents: bool = True  # run subagents concurrently (only effective on DeepSeek)
+
     # Embeddings / RAG
     embed_model: str = "nomic-embed-text"
     relevance_min: float = 0.60  # cosine cutoff (calibrated: on-topic >=0.62, off-topic <=0.58)
@@ -45,6 +54,16 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def subagent_ceiling(backend: str | None = None) -> int:
+    """Max subagents the lead may spawn, given the active backend.
+
+    Local Ollama runs subagents one-at-a-time (one GPU), so the ceiling is a
+    patience limit; DeepSeek runs them in parallel, so it can afford more.
+    """
+    b = (backend or settings.default_backend).lower()
+    return settings.max_subagents_deepseek if b == "deepseek" else settings.max_subagents_ollama
 
 # Make sure the data directories exist on import.
 for _d in (PAPERS_DIR, CACHE_DIR, SUMMARIES_DIR, REPORTS_DIR, VECTOR_DIR):

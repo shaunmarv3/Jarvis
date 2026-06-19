@@ -23,10 +23,11 @@ console = Console()
 
 _NODE_LABELS = {
     "clarify": "🧭 understanding your request",
-    "act": "🔎 searching & gathering",
-    "synthesize": "📝 synthesizing findings",
-    "reflect": "🤔 reflecting on gaps",
+    "plan": "🧠 lead agent planning subagents",
+    "fanout": "🔎 subagents researching",
+    "synthesize": "📝 merging subagent findings",
     "finalize": "📄 compiling report",
+    "cite": "🔗 attaching citations",
 }
 
 _HELP = """[bold cyan]Commands[/]
@@ -59,15 +60,11 @@ def _drive(graph, payload, config):
             label = _NODE_LABELS.get(node)
             if label:
                 console.print(f"[dim]· {label}[/]")
-            if node == "act" and isinstance(update, dict):
-                for call in update.get("last_tools", []) or []:
-                    console.print(f"[dim]  → [cyan]{call}[/][/]")
+            if node == "plan" and isinstance(update, dict):
+                for i, sub in enumerate(update.get("plan", []) or [], 1):
+                    console.print(f"[dim]  {i}. {truncate(sub.get('objective', ''), 64)}[/]")
+            if node == "fanout" and isinstance(update, dict):
                 console.print(f"[dim]  ↳ {len(update.get('papers', []))} papers kept[/]")
-            if node == "reflect" and isinstance(update, dict):
-                if update.get("complete"):
-                    console.print("[dim]  ↳ enough gathered[/]")
-                elif update.get("gaps"):
-                    console.print(f"[dim]  ↳ gap: {update['gaps']}[/]")
     return ("done", None)
 
 
@@ -92,15 +89,22 @@ def _run_query(graph, query: str) -> list[dict]:
     while status == "interrupt":
         brief = value.get("brief", "") if isinstance(value, dict) else str(value)
         intent = value.get("intent", "") if isinstance(value, dict) else ""
+        plan = value.get("plan", []) if isinstance(value, dict) else []
+        body = brief
+        if plan:
+            lines = "\n".join(
+                f"  [cyan]{i}.[/] {sub.get('objective', '')}" for i, sub in enumerate(plan, 1)
+            )
+            body += f"\n\n[bold]Plan — {len(plan)} subagent(s):[/]\n{lines}"
         console.print(
             Panel(
-                brief,
+                body,
                 title=f"[bold]research brief[/] [dim]({intent})[/]",
                 border_style="yellow",
             )
         )
         ans = Prompt.ask(
-            "[bold]Proceed?[/] [dim]Y = go · type to refine the brief · n = cancel[/]",
+            "[bold]Proceed?[/] [dim]Y = go · type to refine the brief & re-plan · n = cancel[/]",
             default="y",
         )
         if ans.strip().lower() in {"n", "no", "q", "quit", "cancel"}:
@@ -259,15 +263,34 @@ def _save_paper(papers: list[dict], idx: int) -> None:
         console.print("[yellow]no downloadable PDF for that paper[/]")
 
 
+def _read_line(prompt: str) -> str:
+    """Read a REPL line, stripping a leading BOM that Windows PowerShell prepends
+    when piping stdin. The BOM arrives as U+FEFF if stdin is UTF-8, or as its
+    cp1252 mojibake (\\xef\\xbb\\xbf) if stdin fell back to cp1252 — handle both.
+    `chr()` keeps the markers out of the source as fragile literal bytes.
+    """
+    raw = Prompt.ask(prompt)
+    for bom in (chr(0xFEFF), chr(0xEF) + chr(0xBB) + chr(0xBF)):
+        if raw.startswith(bom):
+            raw = raw[len(bom):]
+            break
+    return raw.strip()
+
+
 def main() -> None:
     # Force UTF-8 so the ASCII banner / box-drawing chars never hit a cp1252 crash on Windows.
     import sys
 
-    for _stream in (sys.stdout, sys.stderr):
+    for _stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             _stream.reconfigure(encoding="utf-8")
         except Exception:
             pass
+
+    # Let deep nodes (subagent fan-out) stream live progress to this console.
+    from .events import set_sink
+
+    set_sink(lambda m: console.print(m))
 
     set_active_backend(settings.default_backend)
     try:
@@ -282,7 +305,7 @@ def main() -> None:
 
     while True:
         try:
-            line = Prompt.ask("\n[bold cyan]jarvis[/]").strip()
+            line = _read_line("\n[bold cyan]jarvis[/]")
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]bye 👋[/]")
             break

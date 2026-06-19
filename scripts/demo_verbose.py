@@ -11,7 +11,7 @@ from jarvis.config import settings
 from jarvis.graph import build_graph
 from jarvis.llm import resolve_backend
 
-settings.max_loops = 2  # keep the demo short
+settings.subagent_rounds = 1  # keep the demo short
 
 
 def show(node, update):
@@ -23,18 +23,22 @@ def show(node, update):
         print("intent :", update.get("intent"), flush=True)
         print("brief  :", update.get("brief"), flush=True)
         print("query  :", update.get("current_query"), flush=True)
-    elif node == "act":
+    elif node == "plan":
+        plan = update.get("plan", [])
+        print(f"lead spawned {len(plan)} subagent(s):", flush=True)
+        for i, s in enumerate(plan, 1):
+            print(f"   {i}. {s.get('objective')}  [q: {s.get('sub_query')}]", flush=True)
+    elif node == "fanout":
         papers = update.get("papers", [])
-        print(f"papers gathered so far: {len(papers)}", flush=True)
+        print(f"papers gathered: {len(papers)}", flush=True)
         for p in papers[:6]:
             print(f"   - [{p.get('source')}] {p.get('title')} ({p.get('year')})", flush=True)
     elif node == "synthesize":
         print("findings:\n", (update.get("findings") or "")[:600], flush=True)
-    elif node == "reflect":
-        print("complete:", update.get("complete"), "| gap:", update.get("gaps"), flush=True)
-        print("next_query:", update.get("current_query"), flush=True)
     elif node == "finalize":
-        print("REPORT:\n", update.get("report", ""), flush=True)
+        print("DRAFT REPORT:\n", (update.get("report") or "")[:600], flush=True)
+    elif node == "cite":
+        print("FINAL (cited) REPORT:\n", update.get("report", ""), flush=True)
 
 
 def main():

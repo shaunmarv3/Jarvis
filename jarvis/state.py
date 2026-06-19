@@ -15,6 +15,10 @@ class AgentState(TypedDict, total=False):
     brief: str  # short research brief (confirmed by the user)
     current_query: str  # the query for the current loop iteration
     queries: list  # all queries issued so far
+    plan: list  # lead agent's subagent specs: [{objective, sub_query, tools}]
+    max_subagents: int  # ceiling the lead was allowed (backend-dependent)
+    replan: bool  # confirm step: user edited the brief -> re-plan before fan-out
+    subagent_reports: list  # each subagent's {objective, findings, papers, datasets, web, tools}
     papers: list  # accumulated paper dicts
     datasets: list  # accumulated dataset dicts
     web: list  # accumulated web hits

@@ -1,33 +1,32 @@
-"""LangGraph node functions: clarify, confirm, act, synthesize, reflect, finalize."""
+"""LangGraph node functions for the orchestrator-worker research flow.
+
+Flow: clarify -> plan(lead) -> confirm(human) -> fanout(subagents) -> synthesize
+      -> finalize -> cite.
+
+The reflective search loop lives *inside* each subagent (see subagent.py); the lead
+agent decomposes the brief into independent subagents, fans them out (sequentially on
+Ollama, in parallel on DeepSeek), then merges and cites their findings.
+"""
 
 from __future__ import annotations
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import interrupt
 
-from .config import settings
+from .config import settings, subagent_ceiling
 from .embeddings import rank_by_relevance
+from .events import emit
 from .llm import get_llm
 from .prompts import (
-    ACT_SYSTEM,
-    ACT_USER,
+    CITE_PROMPT,
     CLARIFY_PROMPT,
     FINALIZE_PROMPT,
-    REFLECT_PROMPT,
-    SYNTH_PROMPT,
+    MERGE_PROMPT,
+    PLAN_PROMPT,
 )
 from .state import AgentState
-from .tools import TOOL_FUNCS, TOOL_SCHEMAS
+from .subagent import run_subagent
 from .utils import dedup_papers, extract_json, truncate
-
-# Default tool to run per intent when the model declines to emit a tool call.
-_FALLBACK = {
-    "find_datasets": ["search_datasets"],
-    "pull_exact": ["resolve_title", "search_arxiv"],
-    "read": ["resolve_title", "search_arxiv"],
-    "general": ["search_web", "search_arxiv"],
-}
-_DEFAULT_FALLBACK = ["search_arxiv", "search_semantic_scholar", "search_openalex"]
 
 
 def clarify_node(state: AgentState) -> dict:
@@ -44,24 +43,72 @@ def clarify_node(state: AgentState) -> dict:
         "brief": brief,
         "current_query": first_query,
         "queries": [first_query],
+        "plan": [],
+        "subagent_reports": [],
         "papers": [],
         "datasets": [],
+        "web": [],
         "findings": "",
-        "gaps": "",
         "complete": False,
-        "loop_count": 0,
-        "max_loops": state.get("max_loops") or settings.max_loops,
     }
 
 
-def confirm_node(state: AgentState) -> dict:
-    """Human-in-the-loop: pause for the user to approve or edit the brief.
+def plan_node(state: AgentState) -> dict:
+    """LEAD agent: decompose the brief into independent subagents (count scales to complexity)."""
+    backend = state.get("backend")
+    ceiling = subagent_ceiling(backend)
+    llm = get_llm(backend, temperature=0.2)
+    try:
+        data = extract_json(
+            llm.invoke(
+                PLAN_PROMPT.format(
+                    query=state.get("query", ""),
+                    brief=state.get("brief", ""),
+                    max_subagents=ceiling,
+                )
+            ).content
+        )
+    except Exception:
+        data = {}
 
-    The CLI resumes with `Command(resume=<text>)`. A plain yes/go proceeds;
-    any other text is treated as an edited brief.
+    plan: list[dict] = []
+    for s in (data.get("subagents") or [])[:ceiling]:
+        objective = (s.get("objective") or "").strip()
+        if not objective:
+            continue
+        plan.append(
+            {
+                "objective": objective,
+                "sub_query": (s.get("sub_query") or objective).strip(),
+                "tools": (s.get("tools") or "").strip(),
+            }
+        )
+
+    # Fallback: never leave the lead with no plan — research the brief with one subagent.
+    if not plan:
+        plan = [
+            {
+                "objective": state.get("brief") or state.get("query", ""),
+                "sub_query": state.get("current_query") or state.get("query", ""),
+                "tools": "",
+            }
+        ]
+    return {"plan": plan, "max_subagents": ceiling, "replan": False}
+
+
+def confirm_node(state: AgentState) -> dict:
+    """Human-in-the-loop: show the brief AND the subagent split, wait for approval.
+
+    The CLI resumes with `Command(resume=<text>)`. A plain yes/go proceeds to fan-out;
+    any other text is treated as an edited brief and triggers a re-plan.
     """
     decision = interrupt(
-        {"type": "confirm_brief", "intent": state.get("intent"), "brief": state.get("brief")}
+        {
+            "type": "confirm_plan",
+            "intent": state.get("intent"),
+            "brief": state.get("brief"),
+            "plan": state.get("plan", []),
+        }
     )
     if isinstance(decision, dict):
         decision = decision.get("text", "")
@@ -69,150 +116,93 @@ def confirm_node(state: AgentState) -> dict:
     if text and text.lower() not in {"y", "yes", "go", "ok", "okay", "proceed", "sure"}:
         return {
             "brief": text,
+            "replan": True,
             "messages": [HumanMessage(content=f"(brief refined) {text}")],
         }
-    return {}
+    return {"replan": False}
 
 
-def _run_tool(name: str, args: dict) -> dict:
-    fn = TOOL_FUNCS.get(name)
-    if not fn:
-        return {"text": f"(unknown tool {name})"}
-    try:
-        return fn(**args)
-    except Exception as exc:  # never let a tool crash the graph
-        return {"text": f"(tool {name} failed: {exc})"}
+def after_confirm(state: AgentState) -> str:
+    """Route: re-plan if the user edited the brief, otherwise fan out the subagents."""
+    return "plan" if state.get("replan") else "fanout"
 
 
-def act_node(state: AgentState) -> dict:
-    """One round of tool-calling toward the current goal."""
+def fanout_node(state: AgentState) -> dict:
+    """Dispatch the subagents — sequential on Ollama, parallel (threads) on DeepSeek."""
+    plan = state.get("plan", [])
     backend = state.get("backend")
-    llm = get_llm(backend, temperature=0.2).bind_tools(TOOL_SCHEMAS)
+    total = len(plan)
+    parallel = backend == "deepseek" and settings.parallel_subagents and total > 1
+    emit(f"[dim]· dispatching {total} subagent(s) [{'parallel' if parallel else 'sequential'}][/]")
 
-    msgs = [
-        ("system", ACT_SYSTEM),
-        (
-            "user",
-            ACT_USER.format(
-                brief=state.get("brief", ""),
-                current_query=state.get("current_query", ""),
-                paper_count=len(state.get("papers", [])),
-                gaps=state.get("gaps") or "none yet",
-            ),
-        ),
-    ]
-    try:
-        ai = llm.invoke(msgs)
-        tool_calls = getattr(ai, "tool_calls", None) or []
-    except Exception:
-        tool_calls = []
+    if parallel:
+        from concurrent.futures import ThreadPoolExecutor
 
-    # Fallback: if the model didn't pick tools, run sensible defaults.
-    if not tool_calls:
-        q = state.get("current_query", "")
-        names = _FALLBACK.get(state.get("intent", ""), _DEFAULT_FALLBACK)
-        arg = {"title": q} if names[0] in {"resolve_title", "resolve_doi"} else {"query": q}
-        tool_calls = [{"name": n, "args": arg} for n in names]
+        with ThreadPoolExecutor(max_workers=min(total, 8)) as ex:
+            reports = list(
+                ex.map(
+                    lambda it: run_subagent(it[1], backend, it[0], total),
+                    list(enumerate(plan, 1)),
+                )
+            )
+    else:
+        reports = [run_subagent(s, backend, i, total) for i, s in enumerate(plan, 1)]
 
-    new_papers: list[dict] = []
-    new_datasets: list[dict] = []
-    new_web: list[dict] = []
-    summaries: list[str] = []
-    called: list[str] = []
-    for tc in tool_calls:
-        args = tc.get("args") or {}
-        called.append(f"{tc['name']}({', '.join(f'{k}={truncate(str(v), 40)}' for k, v in args.items())})")
-        out = _run_tool(tc["name"], args)
-        new_papers.extend(out.get("papers", []) or [])
-        new_datasets.extend(out.get("datasets", []) or [])
-        new_web.extend(out.get("web", []) or [])
-        summaries.append(out.get("text", ""))
+    # Aggregate every subagent's haul.
+    all_papers: list[dict] = []
+    all_datasets: list[dict] = []
+    all_web: list[dict] = []
+    tools: list[str] = []
+    for rep in reports:
+        all_papers.extend(rep.get("papers", []) or [])
+        all_datasets.extend(rep.get("datasets", []) or [])
+        all_web.extend(rep.get("web", []) or [])
+        tools.extend(rep.get("tools", []) or [])
 
-    papers = dedup_papers(list(state.get("papers", [])) + new_papers)
-    # Relevance filter: rank against the focused user query (not the verbose brief,
-    # which can inflate scores of tangential papers) and drop off-topic noise.
+    papers = dedup_papers(all_papers)
+    # Relevance filter against the original request (drop off-topic noise).
     ranked = rank_by_relevance(
-        f"{state.get('query', '')} {state.get('current_query', '')}".strip(),
+        state.get("query", ""),
         papers,
         top_k=settings.keep_top_papers,
         min_score=settings.relevance_min,
     )
-    # Never let the filter wipe everything out if scores run low.
     if not ranked and papers:
         ranked = papers[: settings.keep_top_papers]
-    datasets = state.get("datasets", []) + [
-        d for d in new_datasets if d not in state.get("datasets", [])
-    ]
-    evidence = "\n\n".join(s for s in summaries if s)[:6000]
+
+    seen: set[str] = set()
+    datasets: list[dict] = []
+    for d in all_datasets:
+        key = (d.get("url") or d.get("title") or "").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            datasets.append(d)
+
     return {
+        "subagent_reports": reports,
         "papers": ranked,
         "datasets": datasets,
-        "web": state.get("web", []) + new_web,
-        "last_evidence": evidence,
-        "last_tools": called,
-        "messages": [AIMessage(content=evidence)],
+        "web": all_web,
+        "last_tools": tools,
     }
 
 
 def synthesize_node(state: AgentState) -> dict:
-    papers = state.get("papers", [])
-    material = "\n".join(
-        f"- {p.get('title')} ({p.get('year')}): {truncate(p.get('abstract', ''), 240)}"
-        for p in papers[-10:]
-    ) or "(no papers yet)"
-    # Include non-paper evidence (web pages, dataset inspections) from this step.
-    evidence = state.get("last_evidence", "")
-    if evidence:
-        material += "\n\nOther evidence gathered:\n" + truncate(evidence, 2500)
+    """LEAD agent: merge the subagent briefings into one synthesis."""
+    reports = state.get("subagent_reports", [])
+    briefings = "\n\n".join(
+        f"### Subagent {i}: {r.get('objective', '')}\n{r.get('findings', '')}"
+        for i, r in enumerate(reports, 1)
+    ) or "(no subagent findings)"
 
     llm = get_llm(state.get("backend"), temperature=0.3)
     try:
         findings = llm.invoke(
-            SYNTH_PROMPT.format(
-                brief=state.get("brief", ""),
-                findings=state.get("findings") or "(none yet)",
-                new_material=material,
-            )
+            MERGE_PROMPT.format(brief=state.get("brief", ""), briefings=briefings)
         ).content
     except Exception:
-        findings = state.get("findings") or material
+        findings = briefings
     return {"findings": findings}
-
-
-def reflect_node(state: AgentState) -> dict:
-    loop = state.get("loop_count", 0) + 1
-    max_loops = state.get("max_loops", settings.max_loops)
-
-    # Hard stop at the loop budget.
-    if loop >= max_loops:
-        return {"loop_count": loop, "complete": True, "gaps": ""}
-
-    llm = get_llm(state.get("backend"), temperature=0.2)
-    try:
-        data = extract_json(
-            llm.invoke(
-                REFLECT_PROMPT.format(
-                    brief=state.get("brief", ""),
-                    loop=loop,
-                    max_loops=max_loops,
-                    findings=state.get("findings") or "(none)",
-                )
-            ).content
-        )
-    except Exception:
-        data = {}
-
-    complete = bool(data.get("complete"))
-    next_query = (data.get("next_query") or "").strip()
-    gap = (data.get("gap") or "").strip()
-
-    update: dict = {"loop_count": loop, "complete": complete, "gaps": gap}
-    if not complete and next_query:
-        update["current_query"] = next_query
-        update["queries"] = state.get("queries", []) + [next_query]
-    elif not complete and not next_query:
-        update["complete"] = True  # nothing more to ask
-    return update
 
 
 def _format_papers(papers: list[dict]) -> str:
@@ -231,6 +221,7 @@ def _format_datasets(datasets: list[dict]) -> str:
 
 
 def finalize_node(state: AgentState) -> dict:
+    """Draft the report from the merged synthesis (citations added by cite_node)."""
     llm = get_llm(state.get("backend"), temperature=0.4)
     try:
         report = llm.invoke(
@@ -247,8 +238,34 @@ def finalize_node(state: AgentState) -> dict:
             f"Findings:\n{state.get('findings', '')}\n\n"
             f"Papers:\n{_format_papers(state.get('papers', []))}"
         )
+    return {"report": report}
 
-    # Persist the report to disk.
+
+def cite_node(state: AgentState) -> dict:
+    """CITATION agent: pin claims to the real sources retrieved, append a Sources list, persist."""
+    sources: list[dict] = []
+    for p in state.get("papers", [])[:15]:
+        sources.append(
+            {"title": p.get("title", ""), "url": p.get("url") or p.get("pdf_url") or ""}
+        )
+    for w in state.get("web", [])[:8]:
+        sources.append({"title": w.get("title", ""), "url": w.get("url") or ""})
+
+    draft = state.get("report", "")
+    final = draft
+    if sources and draft:
+        numbered = "\n".join(
+            f"[{i}] {s['title']} — {s['url']}" for i, s in enumerate(sources, 1)
+        )
+        llm = get_llm(state.get("backend"), temperature=0.2)
+        try:
+            final = llm.invoke(
+                CITE_PROMPT.format(report=draft, sources=numbered)
+            ).content
+        except Exception:
+            final = draft
+
+    # Persist the final, cited report to disk.
     try:
         import re
         from datetime import datetime
@@ -257,17 +274,9 @@ def finalize_node(state: AgentState) -> dict:
 
         slug = re.sub(r"[^a-z0-9]+", "-", (state.get("query", "report")).lower())[:50].strip("-")
         path = REPORTS_DIR / f"{datetime.now():%Y%m%d-%H%M%S}-{slug}.md"
-        path.write_text(report, encoding="utf-8")
-        report += f"\n\n_(saved to {path})_"
+        path.write_text(final, encoding="utf-8")
+        final += f"\n\n_(saved to {path})_"
     except Exception:
         pass
 
-    return {"report": report, "messages": [AIMessage(content=report)]}
-
-
-def should_continue(state: AgentState) -> str:
-    if state.get("complete") or state.get("loop_count", 0) >= state.get(
-        "max_loops", settings.max_loops
-    ):
-        return "finalize"
-    return "act"
+    return {"report": final, "messages": [AIMessage(content=final)]}
