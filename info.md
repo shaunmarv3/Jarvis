@@ -85,8 +85,8 @@ LangGraph orchestrator: a tool-calling agent wrapped in a clarify-confirm-then-r
 
 ```
             ┌──────────────┐
-   topic →  │   clarify    │  classify intent (find / pull exact / read / datasets),
-            └──────┬───────┘  draft a 2-4 line research brief + first query
+   topic →  │   clarify    │  classify intent; draft a provisional brief; if the query is
+            └──────┬───────┘  vague, ask 0-3 clarifying questions (⏸ ask → brief refines it)
                    ▼
             ┌──────────────┐   ⏸ HUMAN-IN-THE-LOOP (LangGraph interrupt):
             │ confirm brief│      show brief + planned tools, wait for go/edit.
@@ -118,6 +118,8 @@ LangGraph orchestrator: a tool-calling agent wrapped in a clarify-confirm-then-r
 - `messages` — chat history (LangChain messages).
 - `intent` — find_papers | pull_exact | read | find_datasets (classified).
 - `brief` — the confirmed research brief.
+- `clarify_questions` — the lead's clarifying questions `[{question, options}]` (empty if specific).
+- `clarify_answers` — the user's answers, one `Q: … | A: …` line each (empty if skipped).
 - `queries` — list of search queries issued.
 - `papers` — found paper metadata (title, authors, year, abstract, ids, pdf_url, source).
 - `read_papers` — id → parsed summary.
@@ -137,8 +139,8 @@ D:\jarvis\
 │   ├── config.py          # pydantic-settings: backend, model names, keys, max_loops, paths
 │   ├── llm.py             # get_llm(backend) -> ChatOllama | ChatDeepSeek (both .bind_tools)
 │   ├── state.py           # AgentState TypedDict (see §4)
-│   ├── prompts.py         # clarify / reflect / synthesize / finalize prompt templates
-│   ├── nodes.py           # node functions (clarify, confirm, act, synthesize, reflect, finalize)
+│   ├── prompts.py         # clarify / brief / plan / subagent / merge / cite prompt templates
+│   ├── nodes.py           # node functions (clarify, ask, brief, plan, confirm, fanout, synthesize, finalize, cite)
 │   ├── graph.py           # build_graph(): nodes + conditional edges + checkpointer
 │   ├── banner.py          # pyfiglet "JARVIS" + rich styling (fallback: static ASCII art)
 │   ├── cli.py             # Rich REPL entrypoint + slash commands
@@ -352,13 +354,22 @@ system](https://www.anthropic.com/engineering/multi-agent-research-system)*.
 
 ### Architecture (new graph)
 ```
-  clarify ─► plan(lead) ─► confirm(human) ──edit──► plan        (re-plan on edit)
-                               │ go
-                               ▼
-                    ┌── subagent 1 (own context + tools) ──┐
-                    ├── subagent 2 (own context + tools) ──┤─► synthesize ─► finalize ─► cite ─► END
-                    └── subagent N (own context + tools) ──┘    (merge)       (draft)   (sources)
+  clarify ─┬─vague──► ask(human) ⏸ ─► brief ─┐
+           └─specific────────────────────────┤─► plan(lead) ─► confirm(human) ──edit──► plan
+                                              │                     │ go         (re-plan on edit)
+                                              │                     ▼
+                                   ┌── subagent 1 (own context + tools) ──┐
+                                   ├── subagent 2 (own context + tools) ──┤─► synthesize ─► finalize ─► cite ─► END
+                                   └── subagent N (own context + tools) ──┘    (merge)       (draft)   (sources)
 ```
+- **`clarify`** — classifies intent, drafts a *provisional* brief, and (only when the query is
+  vague) proposes **0–3 clarifying questions** with 2–4 options each. `after_clarify` (conditional
+  edge) routes to `ask` if there are questions, else straight to `plan`.
+- **`ask`** — human-in-the-loop `interrupt` (no LLM). The CLI renders each question; a number picks
+  an option, free text gives a custom answer, Enter/0 skips. Specific queries never reach this node.
+- **`brief`** — refines the provisional brief from the answers (`BRIEF_PROMPT`). Runs **only when the
+  user actually answered**, so a precise query costs no extra LLM call. Skipped-everything keeps the
+  provisional brief as-is.
 - **`plan` (lead agent)** — decomposes the confirmed brief into independent subagent specs
   `{objective, sub_query, tools}`. **Count scales to complexity** (1 for a fact, 2-3 for a
   comparison, more for a survey), bounded by a backend-dependent ceiling.
@@ -404,6 +415,20 @@ sharper follow-up query, round 2 = narrowed. Then it writes a <150-word briefing
   `subagent_reports`, `replan`, `max_subagents`), `config.py` (+subagent settings + `subagent_ceiling()`),
   `cli.py` (shows the plan at confirm, streams subagent progress via the events sink),
   `scripts/demo_verbose.py` (new node names).
+
+### Clarify-first Q&A (added after the multi-agent rebuild)
+The plan promised "clarify before doing anything", but the build jumped query→brief without ever
+asking the user. Restored as an interactive step: `clarify` now emits **0–3 clarifying questions**
+when a query is vague, a new **`ask`** interrupt collects answers (pick / type-your-own / skip),
+and a new **`brief`** node refines the brief from them — all **smart-skipped** for specific queries.
+- **New nodes/edges:** `ask_node`, `brief_node`, `after_clarify` router; `graph.py` edge
+  `clarify ─►(ask|plan)` then `ask ─► brief ─► plan`.
+- **New prompts:** `CLARIFY_PROMPT` reworked to return `{intent, brief, query, questions[]}`; new
+  `BRIEF_PROMPT` for the refine step.
+- **State:** `+clarify_questions`, `+clarify_answers`.
+- **CLI:** `_ask_clarifying()` renders the questions; the interrupt loop branches on
+  `value["type"]` (`clarify_questions` vs `confirm_plan`); a live `console.status` spinner now shows
+  immediately and renames per stage, so the slow first Ollama call no longer looks frozen.
 
 ### New config (`.env`)
 `MAX_SUBAGENTS_OLLAMA=5`, `MAX_SUBAGENTS_DEEPSEEK=10`, `SUBAGENT_ROUNDS=2`, `PARALLEL_SUBAGENTS=true`.

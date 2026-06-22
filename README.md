@@ -39,18 +39,19 @@ researching one facet in its own context — then merges and cites their finding
 - **Relevance-filtered** — embedding-similarity filter drops off-topic papers from results.
 - **Digs like a madman** — each subagent runs a bounded broad→narrow search loop in isolation.
 - **Two brains, switchable** — local **Ollama** (`qwen3.5:9b`) for free/offline, or **DeepSeek** cloud for heavier reasoning.
-- **Asks first** — drafts a research brief **and the subagent split**, and waits for your "go" before touching any tool.
+- **Asks first** — when your query is vague it asks a couple of **clarifying questions** (pick an option or type your own), then drafts a research brief **and the subagent split** and waits for your "go" before touching any tool. Specific queries skip the questions.
 - **Shows its work & saves it** — streams every subagent and tool call live; persists summaries & reports to disk.
 
 ## How it works
 
 ```
-  topic ─► clarify ─► plan (lead) ─► confirm ──edit──► (re-plan)
-                         │              ⏸ you
-                         │            approve
-                         ▼               │
-              splits into N sub-questions│
-                                         ▼
+  topic ─► clarify ─┬─vague─► ask ⏸ ─► brief ─┐
+                    └─specific───────────────►├─► plan (lead) ─► confirm ──edit──► (re-plan)
+                                              │      │              ⏸ you
+                                              │      │            approve
+                                              ▼      ▼               │
+                                   splits into N sub-questions       │
+                                                                     ▼
                         ┌── subagent 1 (own context + tools) ──┐
                         ├── subagent 2 (own context + tools) ──┤─► synthesize ─► finalize ─► cite ─► report
                         └── subagent N (own context + tools) ──┘    (merge)      (draft)   (sources)
@@ -125,19 +126,29 @@ Python directly, so you don't need to activate the venv first.
 ## Usage
 
 ```text
-> find recent papers on retrieval-augmented generation evaluation
+> rag eval
 
-   Brief: Survey 2024-2026 work on evaluating RAG systems; prioritize
-            benchmark/metric papers. Tools: arXiv, Semantic Scholar, OpenAlex.
+   ? What kind of evaluation matters most?
+     1) Retrieval quality   2) Faithfulness / hallucination   3) Task success
+     (or type your own · Enter/0 to skip)
+   > 2
+
+   Brief: Survey recent work on evaluating RAG systems, focused on answer
+            faithfulness & hallucination. Tools: arXiv, Semantic Scholar, OpenAlex.
+
+   Plan — 4 subagent(s): 1. faithfulness metrics  2. hallucination detection  …
      Proceed? [Y/edit/n] y
 
-   arXiv …   OpenAlex …   reflecting (gap: faithfulness metrics) …   arXiv …
-   Report ready — 6 papers, 2 follow-ups.
+   · subagents researching …   · merging findings …   · compiling report …
+   Report ready — 12 papers cited.
 
-> read 1          # downloads + summarizes the first result
+> /read 1          # downloads + summarizes + indexes the first result
+> /ask 1 what metric does it propose?
 > /backend deepseek
 > find datasets for question answering over scientific papers
 ```
+
+A *specific* query (`summarize arXiv 2309.15217`) skips the questions and goes straight to the brief.
 
 ### Commands
 
@@ -189,7 +200,7 @@ jarvis/
 │   ├── qa.py              # chat-with-paper RAG + summary persistence
 │   ├── state.py           # LangGraph AgentState
 │   ├── graph.py           # graph assembly
-│   ├── nodes.py           # clarify / plan(lead) / confirm / fanout / synthesize / finalize / cite
+│   ├── nodes.py           # clarify / ask / brief / plan(lead) / confirm / fanout / synthesize / finalize / cite
 │   ├── subagent.py        # isolated per-subagent broad→narrow research loop
 │   ├── events.py          # live-progress sink (subagents stream to the CLI)
 │   ├── prompts.py         # prompt templates
