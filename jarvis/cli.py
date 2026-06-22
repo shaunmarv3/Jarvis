@@ -24,6 +24,7 @@ console = Console()
 
 _NODE_LABELS = {
     "clarify": " understanding your request",
+    "brief": " refining the brief from your answers",
     "plan": " lead agent planning subagents",
     "fanout": " subagents researching",
     "synthesize": " merging subagent findings",
@@ -46,23 +47,71 @@ def _build_help() -> str:
 _HELP = _build_help()
 
 
-def _drive(graph, payload, config):
-    """Stream the graph, printing progress. Returns ('interrupt', value) or ('done', None)."""
-    for chunk in graph.stream(payload, config, stream_mode="updates"):
-        if "__interrupt__" in chunk:
-            intr = chunk["__interrupt__"]
-            value = intr[0].value if isinstance(intr, (list, tuple)) else intr
-            return ("interrupt", value)
-        for node, update in chunk.items():
-            label = _NODE_LABELS.get(node)
-            if label:
-                console.print(f"[dim]· {label}[/]")
-            if node == "plan" and isinstance(update, dict):
-                for i, sub in enumerate(update.get("plan", []) or [], 1):
-                    console.print(f"[dim]  {i}. {truncate(sub.get('objective', ''), 64)}[/]")
-            if node == "fanout" and isinstance(update, dict):
-                console.print(f"[dim]  ↳ {len(update.get('papers', []))} papers kept[/]")
+# What the agent is busy doing *after* each node returns (the next blocking stage),
+# so the live spinner always names what's actually running — never blank.
+_BUSY_AFTER = {
+    "clarify": "planning the research",
+    "brief": "planning the research",
+    "fanout": "merging findings",
+    "synthesize": "compiling the report",
+    "finalize": "attaching citations",
+}
+
+
+def _drive(graph, payload, config, busy: str = "working"):
+    """Stream the graph behind a live spinner. Returns ('interrupt', value) or ('done', None).
+
+    `stream_mode="updates"` only yields *after* a node finishes, and the first Ollama
+    call is a slow cold-start — so without a spinner the screen looks frozen. The spinner
+    shows instantly and updates its label as each stage completes.
+    """
+    with console.status(f"[cyan]{busy}…[/]", spinner="dots") as status:
+        for chunk in graph.stream(payload, config, stream_mode="updates"):
+            if "__interrupt__" in chunk:
+                intr = chunk["__interrupt__"]
+                value = intr[0].value if isinstance(intr, (list, tuple)) else intr
+                return ("interrupt", value)
+            for node, update in chunk.items():
+                label = _NODE_LABELS.get(node)
+                if label:
+                    console.print(f"[dim]· {label}[/]")
+                if node == "plan" and isinstance(update, dict):
+                    for i, sub in enumerate(update.get("plan", []) or [], 1):
+                        console.print(f"[dim]  {i}. {truncate(sub.get('objective', ''), 64)}[/]")
+                if node == "fanout" and isinstance(update, dict):
+                    console.print(f"[dim]  ↳ {len(update.get('papers', []))} papers kept[/]")
+                nxt = _BUSY_AFTER.get(node)
+                if nxt:
+                    status.update(f"[cyan]{nxt}…[/]")
     return ("done", None)
+
+
+def _ask_clarifying(questions: list[dict]) -> str:
+    """Render each clarifying question and collect one answer apiece.
+
+    A number picks an option, free text becomes a custom answer, Enter/0 skips that
+    question. Returns a "Q: … | A: …" block (empty if everything was skipped).
+    """
+    if not questions:
+        return ""
+    console.print(
+        "[dim]a couple of quick questions to sharpen the search "
+        "(number to pick · type your own · Enter to skip):[/]"
+    )
+    lines: list[str] = []
+    for q in questions:
+        text = q.get("question", "")
+        opts = q.get("options", []) or []
+        console.print(f"\n[bold cyan]? {text}[/]")
+        for i, opt in enumerate(opts, 1):
+            console.print(f"   [green]{i}[/]) {opt}")
+        console.print("   [dim](or type your own · Enter/0 to skip)[/]")
+        raw = Prompt.ask("[bold]>[/]", default="").strip()
+        if not raw or raw == "0":
+            continue
+        answer = opts[int(raw) - 1] if (raw.isdigit() and 1 <= int(raw) <= len(opts)) else raw
+        lines.append(f"Q: {text} | A: {answer}")
+    return "\n".join(lines)
 
 
 def _run_query(graph, query: str) -> list[dict]:
@@ -82,8 +131,19 @@ def _run_query(graph, query: str) -> list[dict]:
         "max_loops": settings.max_loops,
     }
 
-    status, value = _drive(graph, init, config)
+    status, value = _drive(graph, init, config, busy="understanding your request")
     while status == "interrupt":
+        itype = value.get("type") if isinstance(value, dict) else None
+
+        # Stage 1 — clarifying questions (only fires for vague queries).
+        if itype == "clarify_questions":
+            answers = _ask_clarifying(value.get("questions", []))
+            status, value = _drive(
+                graph, Command(resume={"answers": answers}), config, busy="drafting the brief"
+            )
+            continue
+
+        # Stage 2 — confirm the brief + subagent plan.
         brief = value.get("brief", "") if isinstance(value, dict) else str(value)
         intent = value.get("intent", "") if isinstance(value, dict) else ""
         plan = value.get("plan", []) if isinstance(value, dict) else []
@@ -107,7 +167,7 @@ def _run_query(graph, query: str) -> list[dict]:
         if ans.strip().lower() in {"n", "no", "q", "quit", "cancel"}:
             console.print("[red]cancelled[/]")
             return []
-        status, value = _drive(graph, Command(resume=ans), config)
+        status, value = _drive(graph, Command(resume=ans), config, busy="researching")
 
     final = graph.get_state(config).values
     report = final.get("report") or final.get("findings") or "(no results)"

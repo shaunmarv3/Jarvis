@@ -13,6 +13,8 @@ class AgentState(TypedDict, total=False):
     backend: str  # "ollama" | "deepseek"
     intent: str  # find_papers | pull_exact | read | find_datasets | general
     brief: str  # short research brief (confirmed by the user)
+    clarify_questions: list  # lead's clarifying questions: [{question, options}] (may be empty)
+    clarify_answers: str  # the user's answers, formatted "Q: ... | A: ..." per line
     current_query: str  # the query for the current loop iteration
     queries: list  # all queries issued so far
     plan: list  # lead agent's subagent specs: [{objective, sub_query, tools}]

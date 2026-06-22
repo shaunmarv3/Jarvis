@@ -4,21 +4,44 @@ CLARIFY_PROMPT = """You are Jarvis, a research planning assistant. The user said
 
 "{query}"
 
-Classify the request and draft a SHORT research brief (2-4 lines) describing what to find
-and which sources to prioritize.
+Do two things:
+1) Classify intent and draft a SHORT provisional research brief (2-4 lines).
+2) Decide whether the request is ambiguous enough to warrant a FEW clarifying questions.
+   Ask 0-3 questions ONLY when the answer would meaningfully change what you research
+   (scope, angle, time range, or what kind of result they want). Ask NONE when the request
+   is already specific (e.g. it names a paper/title/arXiv id/DOI, or is otherwise unambiguous).
 
 Reply with ONLY a JSON object:
 {{
   "intent": one of ["find_papers","pull_exact","read","find_datasets","general"],
-  "brief": "<2-4 line plan, mentioning which tools/sources you'll use>",
-  "query": "<a focused first search query>"
+  "brief": "<2-4 line provisional plan, mentioning which tools/sources to prioritize>",
+  "query": "<a focused first search query>",
+  "questions": [
+    {{"question": "<short, concrete question>", "options": ["<opt1>","<opt2>","<opt3>"]}}
+  ]
 }}
 
-Guidance:
-- "pull_exact" when the user names a specific paper/title/arXiv id/DOI.
-- "find_datasets" when they want data, benchmarks, or corpora.
-- "read" when they want a paper explained/summarized.
-- "find_papers" for general literature discovery (default for topics)."""
+Rules:
+- At most 3 questions. Use an EMPTY list when the request is already specific.
+- Each question gets 2-4 short, concrete options the user can pick from.
+- Intent guidance: "pull_exact" = a named paper/title/arXiv id/DOI; "find_datasets" = data/
+  benchmarks/corpora; "read" = explain/summarize a paper; "find_papers" = general literature
+  discovery (default for topics)."""
+
+BRIEF_PROMPT = """You are Jarvis. Refine the provisional research brief using the user's answers
+to your clarifying questions.
+
+Original request: "{query}"
+Provisional brief: {brief}
+
+User's clarifications:
+{answers}
+
+Reply with ONLY a JSON object:
+{{
+  "brief": "<2-4 line refined plan that reflects the clarifications, naming the tools/sources to prioritize>",
+  "query": "<a focused first search query>"
+}}"""
 
 PLAN_PROMPT = """You are the LEAD research agent (an orchestrator). Given a confirmed research
 brief, design a plan that splits the work across independent SUBAGENTS — each researches ONE facet

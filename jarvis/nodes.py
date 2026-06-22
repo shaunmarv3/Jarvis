@@ -18,6 +18,7 @@ from .embeddings import rank_by_relevance
 from .events import emit
 from .llm import get_llm
 from .prompts import (
+    BRIEF_PROMPT,
     CITE_PROMPT,
     CLARIFY_PROMPT,
     FINALIZE_PROMPT,
@@ -30,6 +31,7 @@ from .utils import dedup_papers, extract_json, truncate
 
 
 def clarify_node(state: AgentState) -> dict:
+    """Classify intent, draft a PROVISIONAL brief, and (only if vague) propose clarifying questions."""
     query = state.get("query") or ""
     llm = get_llm(state.get("backend"), temperature=0.2)
     raw = llm.invoke(CLARIFY_PROMPT.format(query=query)).content
@@ -38,11 +40,25 @@ def clarify_node(state: AgentState) -> dict:
     intent = data.get("intent") or "find_papers"
     brief = data.get("brief") or f"Research the user's request: {query}"
     first_query = data.get("query") or query
+
+    # Keep only well-formed questions (text + up to 4 options), cap at 3.
+    questions: list[dict] = []
+    for q in (data.get("questions") or [])[:3]:
+        if not isinstance(q, dict):
+            continue
+        text = (q.get("question") or "").strip()
+        if not text:
+            continue
+        opts = [str(o).strip() for o in (q.get("options") or []) if str(o).strip()][:4]
+        questions.append({"question": text, "options": opts})
+
     return {
         "intent": intent,
         "brief": brief,
         "current_query": first_query,
         "queries": [first_query],
+        "clarify_questions": questions,
+        "clarify_answers": "",
         "plan": [],
         "subagent_reports": [],
         "papers": [],
@@ -51,6 +67,50 @@ def clarify_node(state: AgentState) -> dict:
         "findings": "",
         "complete": False,
     }
+
+
+def after_clarify(state: AgentState) -> str:
+    """Route: ask the user the clarifying questions if there are any, else plan straight away."""
+    return "ask" if state.get("clarify_questions") else "plan"
+
+
+def ask_node(state: AgentState) -> dict:
+    """Human-in-the-loop: pause so the CLI can collect answers to the clarifying questions.
+
+    The CLI resumes with `Command(resume=<answers>)`, where answers is a formatted
+    "Q: ... | A: ..." string (or a dict carrying one). Empty answers = user skipped.
+    """
+    decision = interrupt(
+        {
+            "type": "clarify_questions",
+            "questions": state.get("clarify_questions", []),
+        }
+    )
+    answers = decision.get("answers", "") if isinstance(decision, dict) else (decision or "")
+    return {"clarify_answers": (answers or "").strip()}
+
+
+def brief_node(state: AgentState) -> dict:
+    """Refine the provisional brief using the user's answers (skipped-everything keeps it as-is)."""
+    answers = (state.get("clarify_answers") or "").strip()
+    if not answers:
+        return {}  # nothing clarified — provisional brief stands
+    llm = get_llm(state.get("backend"), temperature=0.2)
+    try:
+        data = extract_json(
+            llm.invoke(
+                BRIEF_PROMPT.format(
+                    query=state.get("query", ""),
+                    brief=state.get("brief", ""),
+                    answers=answers,
+                )
+            ).content
+        )
+    except Exception:
+        data = {}
+    brief = (data.get("brief") or "").strip() or state.get("brief", "")
+    first_query = (data.get("query") or "").strip() or state.get("current_query", "")
+    return {"brief": brief, "current_query": first_query, "queries": [first_query]}
 
 
 def plan_node(state: AgentState) -> dict:

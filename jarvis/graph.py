@@ -1,8 +1,9 @@
 r"""Assemble the LangGraph orchestrator-worker research flow.
 
-clarify -> plan(lead) -> confirm(human) --edit--> plan
-                                         \--go--> fanout(subagents) -> synthesize
-                                                  -> finalize -> cite -> END
+clarify --questions?--> ask(human) -> brief -> plan
+        \--none-------------------------------> plan
+plan -> confirm(human) --edit--> plan
+                        \--go--> fanout(subagents) -> synthesize -> finalize -> cite -> END
 """
 
 from __future__ import annotations
@@ -11,7 +12,10 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from .nodes import (
+    after_clarify,
     after_confirm,
+    ask_node,
+    brief_node,
     cite_node,
     clarify_node,
     confirm_node,
@@ -31,6 +35,8 @@ def build_graph(checkpointer=None):
     """
     g = StateGraph(AgentState)
     g.add_node("clarify", clarify_node)
+    g.add_node("ask", ask_node)
+    g.add_node("brief", brief_node)
     g.add_node("plan", plan_node)
     g.add_node("confirm", confirm_node)
     g.add_node("fanout", fanout_node)
@@ -39,7 +45,10 @@ def build_graph(checkpointer=None):
     g.add_node("cite", cite_node)
 
     g.add_edge(START, "clarify")
-    g.add_edge("clarify", "plan")
+    # Ask clarifying questions only when the lead produced any; otherwise plan straight away.
+    g.add_conditional_edges("clarify", after_clarify, {"ask": "ask", "plan": "plan"})
+    g.add_edge("ask", "brief")
+    g.add_edge("brief", "plan")
     g.add_edge("plan", "confirm")
     g.add_conditional_edges("confirm", after_confirm, {"plan": "plan", "fanout": "fanout"})
     g.add_edge("fanout", "synthesize")
