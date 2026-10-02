@@ -59,22 +59,40 @@ and its open-sourced [lead / subagent prompts](https://github.com/anthropics/cla
 ## How it works
 
 ```
-  you ─► clarify ─(vague?)─► ask ⏸ ─► brief ─┐
-                                             ▼
-                          plan (LEAD: classify + delegate) ─► confirm ⏸ ──edit──► re-plan
-                                             │ approve
-             ┌───────────────────────────────┼──────────────────────────────┐
-             ▼                               ▼                              ▼
-     subagent 1 (worker model)      subagent 2                     subagent N
-     ┌───────────────────────┐
-     │ think → tools ∥ tools │  ← parallel tool calls, results fed back,
-     │   ↑         ↓         │    full-text reads, budget + novelty stop
-     │   └── read results ───┘
-     └──────────┬────────────┘     every result → shared SOURCE REGISTRY (S1, S2, …)
-                ▼
-     review (LEAD) ──gaps?──► one follow-up wave ──┐
-                └──ok───────────────────────────────┴─► report (LEAD, keeps [S#] tags)
-                                                         ─► cite (code: [S#] → [n] + Sources)
+ you
+  │
+  ▼
+ clarify ──vague?──► ask you 1-3 questions ──► brief ──┐
+  │ specific                                           │
+  ▼                                                    │
+ plan (LEAD) ◄─────────────────────────────────────────┘
+  │  classifies the query (straightforward / depth-first / breadth-first)
+  │  and writes one delegation per subagent
+  ▼
+ confirm (you) ──edit──► back to plan with your changes
+  │ go
+  ├───────────────────┬───────────────────┐
+  ▼                   ▼                   ▼
+ subagent 1          subagent 2     …    subagent N      worker model, own context;
+  │                   │                   │                parallel on DeepSeek, one by one on Ollama
+  ├───────────────────┴───────────────────┘
+  ▼
+ review (LEAD) ──gaps?──► follow-up wave (≤ 2 subagents, runs once) ──┐
+  │ ok                                                                │
+  ▼                                                                   │
+ report (LEAD) ◄──────────────────────────────────────────────────────┘
+  │  every claim keeps its [S#] source tag
+  ▼
+ cite (code) ──► [S#] → [1] [2] … + Sources list, built from the registry
+
+ inside every subagent:
+
+   ┌─────────────────────────────────────────────────────┐
+   │  LLM turn ──► 2-3 tools in parallel ──► results     │  repeats until complete_task,
+   │     ▲                                      │        │  budget used, or searches
+   │     └────────── reads its own results ◄────┘        │  stop finding anything new
+   └─────────────────────────────────────────────────────┘
+   every result ──► shared SOURCE REGISTRY (S1, S2, …) ──► used by cite
 ```
 
 Subagents run **in parallel on DeepSeek** and **sequentially on local Ollama** (one GPU);
