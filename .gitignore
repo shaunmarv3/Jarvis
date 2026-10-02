@@ -24,3 +24,5 @@ data/
 .DS_Store
 Thumbs.db
 info.md
+# Local design docs (kept on disk, not in the repo)
+docs/

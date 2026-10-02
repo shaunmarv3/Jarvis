@@ -210,26 +210,42 @@ behavior, DeepSeek thinking-mode payloads, and cost accounting.
 ## Project structure
 
 ```
-jarvis/
-├── config.py        settings: lead/worker models, prices, budgets, optional keys
-├── llm.py           get_llm(role=lead|worker) · DeepSeek thinking fix · usage/cost tracker
-├── graph.py         LangGraph flow + SQLite checkpointer
-├── nodes.py         clarify / plan (lead) / confirm / fanout / review / followup / report / cite
-├── subagent.py      the agentic tool loop for one delegated task
-├── sources.py       source registry + deterministic citations
-├── prompts.py       lead / subagent / review / report prompts (after Anthropic's cookbook)
-├── headless.py      run a research request without a human (smoke tests, evals)
-├── tools/
-│   ├── _http.py     rate limiting · retries · disk cache
-│   ├── arxiv_tool.py  semantic_scholar.py  openalex.py  crossref.py
-│   ├── reader.py    full-text paper reading with focused passage selection
-│   ├── web.py       Tavily → Exa → DuckDuckGo · page reading
-│   ├── github.py  hf_models.py  datasets.py  hf_inspect.py  community.py
-│   └── pdf_reader.py  (map-reduce paper summaries for /read)
-├── store.py · qa.py · embeddings.py   per-paper vector stores & Q&A
-└── cli.py · repl.py · banner.py       the terminal UI
-evals/   queries.jsonl · judge.py · run_evals.py · results/
-tests/   offline unit + integration tests
+Jarvis/                          (repo root)
+├── jarvis/                      the Python package
+│   ├── __main__.py              `python -m jarvis` entry point
+│   ├── cli.py                   Rich REPL: live progress, plan approval, report, run summary
+│   ├── repl.py                  prompt_toolkit input + live /command dropdown
+│   ├── banner.py                JARVIS ASCII banner
+│   ├── config.py                settings: lead/worker models, prices, budgets, optional keys
+│   ├── llm.py                   get_llm(role=lead|worker) · DeepSeek thinking fix · usage/cost tracker
+│   ├── graph.py                 LangGraph flow + SQLite checkpointer
+│   ├── state.py                 the graph's shared state
+│   ├── nodes.py                 clarify / plan (lead) / confirm / fanout / review / followup / report / cite
+│   ├── subagent.py              the agentic tool loop for one delegated task
+│   ├── sources.py               source registry + deterministic citations
+│   ├── prompts.py               lead / subagent / review / report prompts (after Anthropic's cookbook)
+│   ├── events.py                progress sink (subagents stream live lines to the CLI)
+│   ├── headless.py              run a research request without a human (smoke tests, evals)
+│   ├── store.py · qa.py · embeddings.py   per-paper vector stores & /ask Q&A
+│   ├── utils.py                 JSON extraction, chunking, truncation
+│   └── tools/
+│       ├── __init__.py          tool registry (schemas the LLM sees + raw functions)
+│       ├── _http.py             rate limiting · retries · disk cache
+│       ├── arxiv_tool.py · semantic_scholar.py · openalex.py · crossref.py   papers
+│       ├── reader.py            full-text paper reading with focused passage selection
+│       ├── web.py               Tavily → Exa → DuckDuckGo search · page reading
+│       ├── github.py            GitHub repo search
+│       ├── datasets.py · hf_models.py · hf_inspect.py   HuggingFace datasets & models
+│       ├── community.py         Hacker News (+ Reddit, currently blocked)
+│       └── pdf_reader.py        map-reduce paper summaries for /read
+├── tests/                       56 offline tests (fake LLM + fake tools)
+├── evals/                       queries.jsonl · judge.py · run_evals.py · results/
+├── scripts/                     smoke.py (one real run) · test_commands.py (CLI commands)
+├── .github/workflows/ci.yml     pytest on push to main / PRs
+├── requirements.txt · requirements-dev.txt · pyproject.toml
+├── .env.example                 copy to .env and add keys
+├── jarvis.bat                   run `jarvis` from any Windows terminal
+└── data/                        (git-ignored) papers, reports, runs/, vectorstore, cache, checkpoints
 ```
 
 ## Roadmap
