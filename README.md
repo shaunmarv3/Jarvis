@@ -26,11 +26,11 @@ _Runs on local Ollama (free) or DeepSeek (≈ $0.07–0.12 per deep research run
 ## ✨ What it does
 
 Jarvis implements the orchestrator-worker design from Anthropic's
-[*How we built our multi-agent research system*](https://www.anthropic.com/engineering/multi-agent-research-system)
+[_How we built our multi-agent research system_](https://www.anthropic.com/engineering/multi-agent-research-system)
 and its open-sourced [lead / subagent prompts](https://github.com/anthropics/claude-cookbooks/tree/main/patterns/agents/prompts):
 
 - **A lead agent that plans like a researcher** — classifies your question
-  (*straightforward / depth-first / breadth-first*), scales the number of subagents to it, and
+  (_straightforward / depth-first / breadth-first_), scales the number of subagents to it, and
   writes each one a full delegation: objective, key questions, source types, tool budget,
   output format and boundaries.
 - **Subagents that are real agents** — each runs an observe → orient → decide → act loop in its
@@ -59,7 +59,7 @@ and its open-sourced [lead / subagent prompts](https://github.com/anthropics/cla
 ## How it works
 
 ```
- you
+ your request
   │
   ▼
  clarify ──vague?──► ask you 1-3 questions ──► brief ──┐
@@ -120,21 +120,21 @@ On Windows you can also put the project folder on `PATH` and run `jarvis.bat` fr
 
 ### Models & cost (DeepSeek)
 
-| Role | Default model | Why | Price / 1M tokens (peak; off-peak is ½) |
-|---|---|---|---|
-| Lead — plan, review, report | `deepseek-v4-pro` (thinking) | few calls, needs judgment | $1.32 in · $3.96 out |
-| Subagents — tool loops | `deepseek-flash` (no thinking) | many calls, needs speed | $0.30 in · $1.20 out |
+| Role                        | Default model                  | Why                       | Price / 1M tokens (peak; off-peak is ½) |
+| --------------------------- | ------------------------------ | ------------------------- | --------------------------------------- |
+| Lead — plan, review, report | `deepseek-v4-pro` (thinking)   | few calls, needs judgment | $1.32 in · $3.96 out                    |
+| Subagents — tool loops      | `deepseek-flash` (no thinking) | many calls, needs speed   | $0.30 in · $1.20 out                    |
 
 A deep run is typically **$0.07–0.12** (see the eval table) — a $5 balance is ~50 runs. Change models with
 `DEEPSEEK_LEAD_MODEL` / `DEEPSEEK_WORKER_MODEL`; `/cost` shows the last run's spend.
 
 ### Optional keys (everything works without them)
 
-| Key | Effect |
-|---|---|
-| `SEMANTIC_SCHOLAR_API_KEY` | your own 1 req/s lane — the keyless shared pool is often rate-limited (429) |
-| `TAVILY_API_KEY` / `EXA_API_KEY` | LLM-grade web search instead of DuckDuckGo |
-| `GITHUB_TOKEN` | higher GitHub search limits |
+| Key                              | Effect                                                                      |
+| -------------------------------- | --------------------------------------------------------------------------- |
+| `SEMANTIC_SCHOLAR_API_KEY`       | your own 1 req/s lane — the keyless shared pool is often rate-limited (429) |
+| `TAVILY_API_KEY` / `EXA_API_KEY` | LLM-grade web search instead of DuckDuckGo                                  |
+| `GITHUB_TOKEN`                   | higher GitHub search limits                                                 |
 
 ## Usage
 
@@ -173,17 +173,17 @@ A deep run is typically **$0.07–0.12** (see the eval table) — a $5 balance i
   └───────────────────────────────────────────────────────────────┘
 ```
 
-| Command | Action |
-|---|---|
-| `<free text>` | research anything — clarify → plan → confirm → research → report |
-| `/papers` · `/sources` | the last run's papers (cited first) · every source it retrieved |
-| `/read <N>` · `/ask [N] <q>` | summarize + index a paper · ask questions about one indexed paper |
-| `/db` · `/use <N>` · `/forget <N>` | manage the paper vector library |
-| `/save <N>` | download paper N's PDF |
-| `/resume` | continue the last run after a crash / Ctrl+C |
-| `/cost` | token usage & estimated cost of the last run |
-| `/dataset <q>` · `/inspect <id>` · `/web <q>` | quick one-off lookups |
-| `/backend ollama\|deepseek` · `/model <name>` | switch brains |
+| Command                                       | Action                                                            |
+| --------------------------------------------- | ----------------------------------------------------------------- |
+| `<free text>`                                 | research anything — clarify → plan → confirm → research → report  |
+| `/papers` · `/sources`                        | the last run's papers (cited first) · every source it retrieved   |
+| `/read <N>` · `/ask [N] <q>`                  | summarize + index a paper · ask questions about one indexed paper |
+| `/db` · `/use <N>` · `/forget <N>`            | manage the paper vector library                                   |
+| `/save <N>`                                   | download paper N's PDF                                            |
+| `/resume`                                     | continue the last run after a crash / Ctrl+C                      |
+| `/cost`                                       | token usage & estimated cost of the last run                      |
+| `/dataset <q>` · `/inspect <id>` · `/web <q>` | quick one-off lookups                                             |
+| `/backend ollama\|deepseek` · `/model <name>` | switch brains                                                     |
 
 ## Evals
 
@@ -198,10 +198,10 @@ python evals/run_evals.py --backend deepseek --limit 4
 python evals/run_evals.py --jarvis-path ../old-checkout --label baseline
 ```
 
-| version | factual accuracy | citation accuracy | completeness | source quality | tool efficiency | **overall** | pass | truncated reports | avg citations | avg time | avg cost |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| previous (`main`) | 0.49 | 0.41 | 0.55 | 0.45 | 0.64 | **0.51** | 2/4 | 2 | 17 | 185 s | — |
-| **this version** | **0.81** | **0.78** | **0.89** | **0.67** | **0.86** | **0.80** | **4/4** | **0** | 48 | 401 s | $0.087 |
+| version           | factual accuracy | citation accuracy | completeness | source quality | tool efficiency | **overall** | pass    | truncated reports | avg citations | avg time | avg cost |
+| ----------------- | ---------------- | ----------------- | ------------ | -------------- | --------------- | ----------- | ------- | ----------------- | ------------- | -------- | -------- |
+| previous (`main`) | 0.49             | 0.41              | 0.55         | 0.45           | 0.64            | **0.51**    | 2/4     | 2                 | 17            | 185 s    | —        |
+| **this version**  | **0.81**         | **0.78**          | **0.89**     | **0.67**       | **0.86**        | **0.80**    | **4/4** | **0**             | 48            | 401 s    | $0.087   |
 
 Run 2026-10-02 on DeepSeek, 4 queries (`rag-eval, agent-bench, lora-qlora, vector-db`), same judge
 (`deepseek-v4-pro`) for both versions. The previous version's failures were exactly the ones the
@@ -265,15 +265,6 @@ Jarvis/                          (repo root)
 ├── jarvis.bat                   run `jarvis` from any Windows terminal
 └── data/                        (git-ignored) papers, reports, runs/, vectorstore, cache, checkpoints
 ```
-
-## Roadmap
-
-- [x] Phase 1–3 — search/fetch/read, RAG chat, datasets, multi-agent orchestrator-worker.
-- [x] **Phase 4** — real agentic subagents, lead classification + rich delegations, gap-filling
-  wave, all source types in one run, grounded citations, lead/worker model split + cost
-  tracking, resumable runs, tests + CI, eval harness.
-- [ ] Next — chat across *all* saved papers, citation-graph exploration (references/cited-by),
-  Streamlit UI, MCP server, Reddit via authenticated API.
 
 ## License
 
