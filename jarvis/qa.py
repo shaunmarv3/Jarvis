@@ -44,7 +44,7 @@ def ask_folder(question: str, folder: str, backend: str | None = None, k: int = 
     if not docs:
         return "No relevant content found in that paper.", []
     context = "\n\n---\n\n".join(f"[{i + 1}] {d.page_content}" for i, d in enumerate(docs))
-    llm = get_llm(backend, temperature=0.2, num_predict=900)
+    llm = get_llm(backend, temperature=0.2, max_tokens=1200)
     answer = llm.invoke(_QA_PROMPT.format(context=context, question=question)).content
     return answer, docs
 

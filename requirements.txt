@@ -1,8 +1,9 @@
-langgraph>=0.2.50
+langgraph>=1.0
+langgraph-checkpoint-sqlite>=2.0
 langchain>=0.3.0
 langchain-core>=0.3.0
 langchain-ollama>=0.2.0
-langchain-deepseek>=0.1.2
+langchain-deepseek>=1.0
 arxiv>=2.1.0
 requests>=2.31.0
 pymupdf4llm>=0.0.17

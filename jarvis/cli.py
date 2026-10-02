@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from langchain_core.messages import HumanMessage
@@ -13,9 +14,9 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from .banner import render_banner
-from .config import settings, subagent_ceiling
+from .config import DATA_DIR, settings, subagent_ceiling
 from .graph import build_graph
-from .llm import active_backend, resolve_backend, set_active_backend
+from .llm import active_backend, resolve_backend, set_active_backend, usage
 from .repl import COMMANDS, read_line, set_session_papers_getter
 from .tools.pdf_reader import summarize_paper
 from .utils import truncate
@@ -25,12 +26,15 @@ console = Console()
 _NODE_LABELS = {
     "clarify": " understanding your request",
     "brief": " refining the brief from your answers",
-    "plan": " lead agent planning subagents",
-    "fanout": " subagents researching",
-    "synthesize": " merging subagent findings",
-    "finalize": " compiling report",
-    "cite": " attaching citations",
+    "plan": " lead agent planned the research",
+    "fanout": " subagents finished researching",
+    "review": " lead reviewed the findings",
+    "followup": " follow-up subagents finished",
+    "report": " lead wrote the report",
+    "cite": " citations attached",
 }
+_LAST_RUN = DATA_DIR / "last_run.json"
+
 
 def _build_help() -> str:
     """Build the /help text from the same COMMANDS list that powers the live dropdown."""
@@ -52,38 +56,90 @@ _HELP = _build_help()
 _BUSY_AFTER = {
     "clarify": "planning the research",
     "brief": "planning the research",
-    "fanout": "merging findings",
-    "synthesize": "compiling the report",
-    "finalize": "attaching citations",
+    "fanout": "lead reviewing findings for gaps",
+    "review": "lead writing the report",
+    "followup": "lead writing the report",
+    "report": "attaching citations",
 }
+
+
+def _fmt_secs(s: float) -> str:
+    s = int(s)
+    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
 
 
 def _drive(graph, payload, config, busy: str = "working"):
     """Stream the graph behind a live spinner. Returns ('interrupt', value) or ('done', None).
 
-    `stream_mode="updates"` only yields *after* a node finishes, and the first Ollama
-    call is a slow cold-start — so without a spinner the screen looks frozen. The spinner
-    shows instantly and updates its label as each stage completes.
+    The spinner names the stage that's running and ticks every second with elapsed
+    time and the cost so far, so a long research run never looks frozen.
     """
+    import threading
+    import time
+
+    t0 = time.time()
+    stage = [busy]
+    stop = threading.Event()
+    backend = active_backend()
+
     with console.status(f"[cyan]{busy}…[/]", spinner="dots") as status:
-        for chunk in graph.stream(payload, config, stream_mode="updates"):
-            if "__interrupt__" in chunk:
-                intr = chunk["__interrupt__"]
-                value = intr[0].value if isinstance(intr, (list, tuple)) else intr
-                return ("interrupt", value)
-            for node, update in chunk.items():
-                label = _NODE_LABELS.get(node)
-                if label:
-                    console.print(f"[dim]· {label}[/]")
-                if node == "plan" and isinstance(update, dict):
-                    for i, sub in enumerate(update.get("plan", []) or [], 1):
-                        console.print(f"[dim]  {i}. {truncate(sub.get('objective', ''), 64)}[/]")
-                if node == "fanout" and isinstance(update, dict):
-                    console.print(f"[dim]  ↳ {len(update.get('papers', []))} papers kept[/]")
-                nxt = _BUSY_AFTER.get(node)
-                if nxt:
-                    status.update(f"[cyan]{nxt}…[/]")
+
+        def tick():
+            while not stop.wait(1.0):
+                cost = usage.cost(backend)
+                money = f" · ${cost:.3f} so far" if backend == "deepseek" else ""
+                status.update(f"[cyan]{stage[0]}…[/] [dim]{_fmt_secs(time.time() - t0)}{money}[/]")
+
+        ticker = threading.Thread(target=tick, daemon=True)
+        ticker.start()
+        try:
+            for chunk in graph.stream(payload, config, stream_mode="updates"):
+                if "__interrupt__" in chunk:
+                    intr = chunk["__interrupt__"]
+                    value = intr[0].value if isinstance(intr, (list, tuple)) else intr
+                    return ("interrupt", value)
+                for node, update in chunk.items():
+                    label = _NODE_LABELS.get(node)
+                    if label:
+                        console.print(f"[dim]· {label}[/]")
+                    if node in ("fanout", "followup") and isinstance(update, dict):
+                        console.print(f"[dim]  ↳ {len(update.get('sources', {}) or {})} unique sources so far[/]")
+                    nxt = _BUSY_AFTER.get(node)
+                    if nxt:
+                        stage[0] = nxt
+        finally:
+            stop.set()
     return ("done", None)
+
+
+def _run_summary(final: dict, backend: str, seconds: float | None) -> None:
+    """The end-of-run panel: what the research cost and what it did."""
+    reports = final.get("subagent_reports") or []
+    calls = sum(r.get("tool_calls") or 0 for r in reports)
+    stats = final.get("citation_stats") or {}
+    snap = usage.snapshot()
+    by_role = usage.cost_by_role(backend)
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column(style="bold")
+    table.add_column()
+    if backend == "deepseek":
+        table.add_row("cost", f"[bold green]${usage.cost(backend):.3f}[/]  [dim](estimated at peak rates; off-peak is half)[/]")
+        table.add_row("  lead", f"${by_role.get('lead', 0):.3f} · {snap['lead']['calls']} calls · "
+                                f"{snap['lead']['in'] / 1000:.1f}k in / {snap['lead']['out'] / 1000:.1f}k out "
+                                f"[dim]({settings.deepseek_lead_model})[/]")
+        table.add_row("  subagents", f"${by_role.get('worker', 0):.3f} · {snap['worker']['calls']} calls · "
+                                     f"{snap['worker']['in'] / 1000:.1f}k in / {snap['worker']['out'] / 1000:.1f}k out "
+                                     f"[dim]({settings.deepseek_worker_model})[/]")
+    else:
+        table.add_row("cost", "[bold green]$0.00[/] [dim](local Ollama)[/]")
+    if seconds is not None:
+        table.add_row("time", _fmt_secs(seconds))
+    table.add_row("research", f"{len(reports)} subagents · {calls} tool calls"
+                  + (f" · {final.get('query_type')}" if final.get("query_type") else ""))
+    if stats:
+        table.add_row("sources", f"{stats.get('cited', 0)} cited of {stats.get('retrieved', 0)} retrieved"
+                      + (f" · {stats['invalid_tags']} invalid tags dropped" if stats.get("invalid_tags") else ""))
+    console.print(Panel(table, title="[bold]run summary[/]", border_style="cyan", expand=False))
 
 
 def _ask_clarifying(questions: list[dict]) -> str:
@@ -114,65 +170,122 @@ def _ask_clarifying(questions: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _run_query(graph, query: str) -> list[dict]:
-    """Run one research request through the graph; returns the session papers."""
-    backend, notice = resolve_backend()
-    if notice:
-        console.print(f"[yellow]{notice}[/]")
+def _plan_panel(value: dict) -> None:
+    plan = value.get("plan", []) or []
+    qtype = value.get("query_type") or value.get("intent", "")
+    body = value.get("brief", "")
+    if plan:
+        rows = [
+            f"  [cyan]{i}.[/] {sub.get('objective', '')}\n"
+            f"     [dim]sources: {', '.join(sub.get('sources', []))} · budget {sub.get('tool_budget', '?')} tool calls[/]"
+            for i, sub in enumerate(plan, 1)
+        ]
+        body += f"\n\n[bold]Plan — {len(plan)} subagent(s):[/]\n" + "\n".join(rows)
+    console.print(Panel(body, title=f"[bold]research brief[/] [dim]({qtype})[/]", border_style="yellow"))
 
-    config = {
-        "configurable": {"thread_id": uuid.uuid4().hex},
-        "recursion_limit": 60,
-    }
-    init = {
-        "messages": [HumanMessage(content=query)],
-        "query": query,
-        "backend": backend,
-        "max_loops": settings.max_loops,
-    }
 
-    status, value = _drive(graph, init, config, busy="understanding your request")
+def _drive_until_done(graph, payload, config, busy: str) -> bool:
+    """Drive the graph through its human-in-the-loop interrupts. False if cancelled."""
+    status, value = _drive(graph, payload, config, busy=busy)
     while status == "interrupt":
         itype = value.get("type") if isinstance(value, dict) else None
-
-        # Stage 1 — clarifying questions (only fires for vague queries).
         if itype == "clarify_questions":
             answers = _ask_clarifying(value.get("questions", []))
-            status, value = _drive(
-                graph, Command(resume={"answers": answers}), config, busy="drafting the brief"
-            )
+            status, value = _drive(graph, Command(resume={"answers": answers}), config, busy="drafting the brief")
             continue
-
-        # Stage 2 — confirm the brief + subagent plan.
-        brief = value.get("brief", "") if isinstance(value, dict) else str(value)
-        intent = value.get("intent", "") if isinstance(value, dict) else ""
-        plan = value.get("plan", []) if isinstance(value, dict) else []
-        body = brief
-        if plan:
-            lines = "\n".join(
-                f"  [cyan]{i}.[/] {sub.get('objective', '')}" for i, sub in enumerate(plan, 1)
-            )
-            body += f"\n\n[bold]Plan — {len(plan)} subagent(s):[/]\n{lines}"
-        console.print(
-            Panel(
-                body,
-                title=f"[bold]research brief[/] [dim]({intent})[/]",
-                border_style="yellow",
-            )
-        )
+        _plan_panel(value if isinstance(value, dict) else {"brief": str(value)})
         ans = Prompt.ask(
             "[bold]Proceed?[/] [dim]Y = go · type to refine the brief & re-plan · n = cancel[/]",
             default="y",
         )
         if ans.strip().lower() in {"n", "no", "q", "quit", "cancel"}:
             console.print("[red]cancelled[/]")
-            return []
-        status, value = _drive(graph, Command(resume=ans), config, busy="researching")
+            return False
+        status, value = _drive(graph, Command(resume=ans), config, busy="subagents researching")
+    return True
 
+
+def _show_report(graph, config, backend: str, seconds: float | None = None) -> list[dict]:
     final = graph.get_state(config).values
-    report = final.get("report") or final.get("findings") or "(no results)"
+    report = final.get("report") or "(no results)"
     console.print(Panel(Markdown(report), title="[bold green]report[/]", border_style="green"))
+    _run_summary(final, backend, seconds)
     return final.get("papers", [])
+
+
+def _run_query(graph, query: str) -> list[dict]:
+    """Run one research request through the graph; returns the session papers."""
+    backend, notice = resolve_backend()
+    if notice:
+        console.print(f"[yellow]{notice}[/]")
+
+    thread_id = uuid.uuid4().hex
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60}
+    try:
+        _LAST_RUN.write_text(json.dumps({"thread_id": thread_id, "query": query, "backend": backend}), encoding="utf-8")
+    except Exception:
+        pass
+    import time
+
+    usage.reset()
+    t0 = time.time()
+    init = {"messages": [HumanMessage(content=query)], "query": query, "backend": backend}
+    if not _drive_until_done(graph, init, config, busy="understanding your request"):
+        return []
+    return _show_report(graph, config, backend, time.time() - t0)
+
+
+def _last_run() -> dict | None:
+    try:
+        return json.loads(_LAST_RUN.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _resume(graph) -> list[dict]:
+    """Continue the last run from its latest checkpoint (after a crash or Ctrl+C)."""
+    last = _last_run()
+    if not last:
+        console.print("[dim]no previous run to resume[/]")
+        return []
+    config = {"configurable": {"thread_id": last["thread_id"]}, "recursion_limit": 60}
+    snap = graph.get_state(config)
+    if not snap or not snap.values:
+        console.print("[dim]the last run has no saved checkpoint[/]")
+        return []
+    backend = last.get("backend", "ollama")
+    if not snap.next:
+        console.print(f"[dim]the last run ({truncate(last.get('query', ''), 50)}) already finished — showing it[/]")
+        return _show_report(graph, config, backend)
+    console.print(f"[cyan]resuming '{truncate(last.get('query', ''), 60)}' at: {', '.join(snap.next)}[/]")
+    set_active_backend(backend)
+    if not _drive_until_done(graph, None, config, busy="resuming"):
+        return []
+    return _show_report(graph, config, backend)
+
+
+def _show_sources(graph) -> None:
+    last = _last_run()
+    values = {}
+    if last:
+        try:
+            values = graph.get_state({"configurable": {"thread_id": last["thread_id"]}}).values
+        except Exception:
+            values = {}
+    sources = values.get("sources") or {}
+    if not sources:
+        console.print("[dim]no sources yet — run a research query first[/]")
+        return
+    table = Table(show_header=True, header_style="bold cyan", box=None)
+    table.add_column("id", justify="right")
+    table.add_column("kind")
+    table.add_column("title")
+    table.add_column("link")
+    for sid, e in sorted(sources.items(), key=lambda kv: int(kv[0][1:])):
+        it = e["item"]
+        table.add_row(sid, e["kind"], truncate(it.get("title", ""), 60),
+                      truncate(it.get("url") or it.get("pdf_url") or "", 50))
+    console.print(table)
 
 
 def _show_papers(papers: list[dict]) -> None:
@@ -248,8 +361,8 @@ def _list_db(select: bool = False) -> str | None:
 
 def _ask(folder: str | None, question: str) -> str | None:
     """Answer a question against ONE paper's store. Returns the folder used."""
-    from .store import list_papers
     from .qa import ask_folder
+    from .store import list_papers
 
     # If no paper selected, let the user pick from the library (no mixing).
     if not folder:
@@ -341,6 +454,8 @@ def main() -> None:
         render_banner(console, active_backend(), settings.ollama_model)
     except Exception:
         console.print("[bold cyan]J A R V I S[/] — personal research agent")
+    if resolve_backend()[0] == "deepseek":
+        console.print(f"[dim]lead: {settings.deepseek_lead_model} · subagents: {settings.deepseek_worker_model}[/]")
 
     graph = build_graph()
     session_papers: list[dict] = []
@@ -369,6 +484,19 @@ def main() -> None:
                 console.print(_HELP)
             elif cmd == "/papers":
                 _show_papers(session_papers)
+            elif cmd == "/sources":
+                _show_sources(graph)
+            elif cmd == "/cost":
+                console.print(f"[dim]{usage.summary(active_backend())}[/]")
+            elif cmd == "/resume":
+                try:
+                    papers = _resume(graph)
+                    if papers:
+                        session_papers = papers
+                except KeyboardInterrupt:
+                    console.print("\n[yellow]interrupted — /resume continues from the last checkpoint[/]")
+                except Exception as exc:
+                    console.print(f"[red]error:[/] {exc}")
             elif cmd == "/read":
                 if arg.isdigit():
                     res = _read_paper(session_papers, int(arg))
@@ -394,7 +522,7 @@ def main() -> None:
                     if not question.strip():
                         console.print("[yellow]add a question: /ask <N> <question>[/]")
                     else:
-                        used = _ask(folder, question)  # picker still kicks in if folder is None
+                        used = _ask(folder, question)
                         if used:
                             current_folder = used
                 else:
@@ -446,6 +574,8 @@ def main() -> None:
                         f"[green]backend → {eff}[/] "
                         f"[dim]· up to {subagent_ceiling(eff)} subagents ({mode})[/]"
                     )
+                    if eff == "deepseek":
+                        console.print(f"[dim]lead: {settings.deepseek_lead_model} · subagents: {settings.deepseek_worker_model}[/]")
                     if notice:
                         console.print(f"[yellow]{notice}[/]")
                 else:
@@ -465,11 +595,11 @@ def main() -> None:
             papers = _run_query(graph, line)
             if papers:
                 session_papers = papers
-                console.print(f"[dim]· {len(papers)} papers available — /papers, /read N[/]")
+                console.print(f"[dim]· {len(papers)} papers available — /papers, /read N · /sources for everything[/]")
         except KeyboardInterrupt:
-            console.print("\n[yellow]interrupted[/]")
+            console.print("\n[yellow]interrupted — /resume continues from the last checkpoint[/]")
         except Exception as exc:  # keep the REPL alive
-            console.print(f"[red]error:[/] {exc}")
+            console.print(f"[red]error:[/] {exc} [dim](/resume retries from the last checkpoint)[/]")
 
 
 if __name__ == "__main__":

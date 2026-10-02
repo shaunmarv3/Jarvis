@@ -52,5 +52,5 @@ def rank_by_relevance(query: str, papers: list[dict], top_k: int, min_score: flo
         p = {**p, "_score": round(cosine(qv, dv), 3)}
         scored.append(p)
     scored.sort(key=lambda x: x["_score"], reverse=True)
-    kept = [p for p in scored if p["_score"] >= min_score] or scored
-    return kept[:top_k]
+    # Never fall back to the unfiltered list: if nothing clears the bar, nothing is relevant.
+    return [p for p in scored if p["_score"] >= min_score][:top_k]

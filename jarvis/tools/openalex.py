@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import requests
-
 from ..config import settings
 from ..utils import truncate
+from . import _http
 
 _BASE = "https://api.openalex.org/works"
 
@@ -41,34 +40,30 @@ def _to_paper(item: dict) -> dict:
 
 
 def openalex_search(query: str, max_results: int = 5) -> dict:
-    """Broad scholarly search with citation counts."""
+    """Broad scholarly search with citation counts.
+
+    Matches title+abstract only: the default `search` also hits full text, which
+    surfaces off-topic papers that merely mention a query word somewhere.
+    """
     try:
-        resp = requests.get(
+        data = _http.get(
             _BASE,
             params={
-                "search": query,
-                "per_page": max_results,
+                "filter": f"title_and_abstract.search:{query.replace(',', ' ')}",
+                "per_page": max(1, min(int(max_results), 25)),
                 "sort": "relevance_score:desc",
                 "mailto": settings.contact_email,
             },
-            timeout=settings.request_timeout,
-            headers={"User-Agent": f"jarvis-research-agent ({settings.contact_email})"},
         )
-        resp.raise_for_status()
-        items = resp.json().get("results", []) or []
+        items = data.get("results", []) or []
     except Exception as exc:
         return {"papers": [], "text": f"OpenAlex search failed: {exc}"}
 
-    papers = [_to_paper(i) for i in items]
+    papers = [_to_paper(i) for i in items if (i.get("title") or i.get("display_name"))]
     if not papers:
         return {"papers": [], "text": f"No OpenAlex results for '{query}'."}
-
     lines = [
-        f"- {p['title']} ({p['year']}, cited {p.get('cited_by', 0)}×) — "
-        f"{truncate(p['abstract'], 160)}"
+        f"- {p['title']} ({p['year']}, cited {p.get('cited_by') or 0}×) — {truncate(p['abstract'], 160)}"
         for p in papers
     ]
-    return {
-        "papers": papers,
-        "text": f"OpenAlex results for '{query}':\n" + "\n".join(lines),
-    }
+    return {"papers": papers, "text": f"OpenAlex results for '{query}':\n" + "\n".join(lines)}

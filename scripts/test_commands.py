@@ -12,8 +12,17 @@ import sys
 
 from prompt_toolkit.document import Document
 
+import tempfile
+from pathlib import Path
+
+import jarvis.store as _store
 from jarvis.config import PAPERS_DIR
-from jarvis.repl import _make_completer, set_session_papers_getter
+from jarvis.repl import COMMANDS, _make_completer, set_session_papers_getter
+
+# Never touch the real vector DB: this script indexes and /forget-deletes papers.
+_TMP_VECTOR_DIR = Path(tempfile.mkdtemp(prefix="jarvis-test-vectors-"))
+_store.VECTOR_DIR = _TMP_VECTOR_DIR
+_store._REGISTRY = _TMP_VECTOR_DIR / "registry.json"
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 results: list[tuple[str, str, str]] = []
@@ -65,7 +74,7 @@ def test_dropdown() -> None:
 
     n_db = len(list_papers())
 
-    check("dropdown: '/' lists all commands", PASS if len(texts("/")) == 14 else FAIL, f"{len(texts('/'))} cmds")
+    check("dropdown: '/' lists all commands", PASS if len(texts("/")) == len(COMMANDS) else FAIL, f"{len(texts('/'))} cmds")
     check("dropdown: '/sa' -> /save", PASS if texts("/sa") == ["/save"] else FAIL, str(texts("/sa")))
     check("dropdown: '/ba' -> /backend", PASS if texts("/ba") == ["/backend"] else FAIL, str(texts("/ba")))
     check("dropdown: '/save ' -> 2 session papers", PASS if texts("/save ") == ["1", "2"] else FAIL, str(texts("/save ")))

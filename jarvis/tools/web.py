@@ -12,30 +12,77 @@ from ..utils import truncate
 _UA = "Mozilla/5.0 (compatible; jarvis-research-agent/0.1)"
 
 
+def _tavily(query: str, n: int) -> list[dict]:
+    resp = requests.post(
+        "https://api.tavily.com/search",
+        json={"query": query, "max_results": n, "search_depth": "basic"},
+        headers={"Authorization": f"Bearer {settings.tavily_api_key}"},
+        timeout=settings.request_timeout,
+    )
+    resp.raise_for_status()
+    return [
+        {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")}
+        for r in resp.json().get("results", [])
+    ]
+
+
+def _exa(query: str, n: int) -> list[dict]:
+    resp = requests.post(
+        "https://api.exa.ai/search",
+        json={"query": query, "numResults": n, "contents": {"text": {"maxCharacters": 800}}},
+        headers={"x-api-key": settings.exa_api_key},
+        timeout=settings.request_timeout,
+    )
+    resp.raise_for_status()
+    return [
+        {"title": r.get("title") or r.get("url", ""), "url": r.get("url", ""), "snippet": (r.get("text") or "")[:800]}
+        for r in resp.json().get("results", [])
+    ]
+
+
+def _ddgs(query: str, n: int) -> list[dict]:
+    from ddgs import DDGS
+
+    with DDGS() as d:
+        raw = list(d.text(query, max_results=n))
+    return [
+        {"title": r.get("title", ""), "url": r.get("href") or r.get("url", ""), "snippet": r.get("body") or r.get("snippet", "")}
+        for r in raw
+    ]
+
+
+def web_providers() -> list[tuple[str, object]]:
+    """Provider chain by available keys: Tavily -> Exa -> DuckDuckGo (always, keyless)."""
+    chain = []
+    if settings.tavily_api_key:
+        chain.append(("tavily", _tavily))
+    if settings.exa_api_key:
+        chain.append(("exa", _exa))
+    chain.append(("duckduckgo", _ddgs))
+    return chain
+
+
 def web_search(query: str, max_results: int = None) -> dict:
-    """Search the open web via DuckDuckGo (free, no key)."""
-    n = max_results or settings.web_max_results
-    try:
-        from ddgs import DDGS
-
-        with DDGS() as d:
-            raw = list(d.text(query, max_results=n))
-    except Exception as exc:
-        return {"web": [], "text": f"Web search failed: {exc}"}
-
-    hits = []
-    for r in raw:
-        hits.append(
-            {
-                "title": r.get("title", ""),
-                "url": r.get("href") or r.get("url", ""),
-                "snippet": r.get("body") or r.get("snippet", ""),
-            }
-        )
+    """Search the open web; falls through the provider chain until one returns results."""
+    n = max(1, min(int(max_results or settings.web_max_results), 10))
+    errors = []
+    hits: list[dict] = []
+    provider = ""
+    for provider, fn in web_providers():
+        try:
+            hits = [h for h in fn(query, n) if h.get("url")]
+        except Exception as exc:
+            errors.append(f"{provider}: {exc}")
+            continue
+        if hits:
+            break
     if not hits:
-        return {"web": [], "text": f"No web results for '{query}'."}
+        why = f" ({'; '.join(errors)})" if errors else ""
+        return {"web": [], "text": f"No web results for '{query}'{why}."}
+    for h in hits:
+        h["source"] = provider
     lines = [f"- {h['title']} — {truncate(h['snippet'], 160)} ({h['url']})" for h in hits]
-    return {"web": hits, "text": f"Web results for '{query}':\n" + "\n".join(lines)}
+    return {"web": hits, "text": f"Web results for '{query}' (via {provider}):\n" + "\n".join(lines)}
 
 
 def _fetch_scrapling(url: str) -> str | None:
@@ -98,12 +145,15 @@ def _extract_text(raw: str, url: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def web_read(url: str, max_chars: int = 6000) -> dict:
-    """Fetch a web page and return its main text content."""
+def web_read(url: str, focus: str = "", max_chars: int = 5000) -> dict:
+    """Fetch a web page and return its main text (the passages most relevant to `focus`)."""
+    from .reader import focused_passages
+
     raw = _fetch_html(url)
     if not raw:
-        return {"text": f"Could not fetch {url}."}
+        return {"text": f"Could not fetch {url} (blocked or offline) — try another source."}
     content = _extract_text(raw, url)
     if not content:
         return {"text": f"No readable text extracted from {url}."}
-    return {"text": f"Content of {url}:\n\n{truncate(content, max_chars)}", "content": content}
+    body = focused_passages(content, focus, max_chars=max_chars) if focus else truncate(content, max_chars)
+    return {"text": f"Content of {url}:\n\n{body}", "content": content}

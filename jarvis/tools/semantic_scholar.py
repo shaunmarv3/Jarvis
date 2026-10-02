@@ -1,19 +1,22 @@
-"""Semantic Scholar Graph API (free, no key, ~1 req/s)."""
+"""Semantic Scholar Graph API (free; optional personal key for a dedicated 1 req/s lane)."""
 
 from __future__ import annotations
 
-import requests
-
 from ..config import settings
 from ..utils import truncate
+from . import _http
 
 _BASE = "https://api.semanticscholar.org/graph/v1"
-_FIELDS = "title,abstract,year,authors,externalIds,openAccessPdf,url"
+_FIELDS = "title,abstract,year,authors,externalIds,openAccessPdf,url,citationCount,venue"
+
+
+def _headers() -> dict:
+    return {"x-api-key": settings.semantic_scholar_api_key} if settings.semantic_scholar_api_key else {}
 
 
 def _to_paper(item: dict) -> dict:
     ext = item.get("externalIds") or {}
-    pdf = (item.get("openAccessPdf") or {}).get("url")
+    pdf = (item.get("openAccessPdf") or {}).get("url") or None
     return {
         "source": "semantic_scholar",
         "id": ext.get("ArXiv") or ext.get("DOI") or item.get("paperId"),
@@ -24,47 +27,43 @@ def _to_paper(item: dict) -> dict:
         "url": item.get("url"),
         "pdf_url": pdf,
         "doi": ext.get("DOI"),
+        "cited_by": item.get("citationCount"),
+        "venue": item.get("venue") or "",
     }
 
 
 def s2_search(query: str, max_results: int = 5) -> dict:
     """Keyword search on Semantic Scholar."""
     try:
-        resp = requests.get(
+        data = _http.get(
             f"{_BASE}/paper/search",
-            params={"query": query, "limit": max_results, "fields": _FIELDS},
-            timeout=settings.request_timeout,
-            headers={"User-Agent": "jarvis-research-agent"},
+            params={"query": query, "limit": max(1, min(int(max_results), 20)), "fields": _FIELDS},
+            headers=_headers(),
+            retries=3 if settings.semantic_scholar_api_key else 1,
         )
-        resp.raise_for_status()
-        items = resp.json().get("data", []) or []
+        items = data.get("data", []) or []
     except Exception as exc:
-        return {"papers": [], "text": f"Semantic Scholar search failed: {exc}"}
+        return {"papers": [], "text": f"Semantic Scholar search failed: {exc}. Use search_arxiv / search_openalex instead."}
 
-    papers = [_to_paper(i) for i in items]
+    papers = [_to_paper(i) for i in items if i.get("title")]
     if not papers:
         return {"papers": [], "text": f"No Semantic Scholar results for '{query}'."}
-
     lines = [
-        f"- {p['title']} ({p['year']}) — {truncate(p['abstract'], 180)}" for p in papers
+        f"- {p['title']} ({p['year']}, cited {p.get('cited_by') or 0}×) — {truncate(p['abstract'], 180)}"
+        for p in papers
     ]
-    return {
-        "papers": papers,
-        "text": f"Semantic Scholar results for '{query}':\n" + "\n".join(lines),
-    }
+    return {"papers": papers, "text": f"Semantic Scholar results for '{query}':\n" + "\n".join(lines)}
 
 
 def s2_resolve_title(title: str) -> dict:
     """Resolve a (possibly fuzzy) title to the single best-matching paper."""
     try:
-        resp = requests.get(
+        data = _http.get(
             f"{_BASE}/paper/search/match",
             params={"query": title, "fields": _FIELDS},
-            timeout=settings.request_timeout,
-            headers={"User-Agent": "jarvis-research-agent"},
+            headers=_headers(),
         )
-        resp.raise_for_status()
-        items = resp.json().get("data", []) or []
+        items = data.get("data", []) or []
     except Exception as exc:
         return {"papers": [], "text": f"Title resolve failed: {exc}"}
 

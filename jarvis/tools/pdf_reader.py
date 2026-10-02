@@ -87,7 +87,7 @@ def summarize_paper(paper: dict, backend: str | None = None, max_chunks: int = 8
     except Exception as exc:
         return {"text": f"Failed to parse PDF '{title}': {exc}"}
 
-    llm = get_llm(backend, temperature=0.2)
+    llm = get_llm(backend, temperature=0.2, max_tokens=1500)
     chunks = chunk_text(markdown, size=6000)[:max_chunks]
     if not chunks:
         return {"text": f"PDF for '{title}' had no extractable text."}

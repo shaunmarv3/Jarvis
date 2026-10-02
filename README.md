@@ -9,12 +9,15 @@
  ╚════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝
 ```
 
-**Your personal AI research agent — in the terminal.**
+**Your personal deep-research agent — in the terminal.**
 
-Searches ideas, pulls exact papers, reads & explains them, and finds datasets —
-looping like a tireless researcher until it has a real answer.
+One question in → a team of agents searches papers, the web, GitHub, HuggingFace and
+Hacker News, reads the important sources in full, and writes a report where every
+citation points at something it actually retrieved.
 
-_Runs on local Ollama or DeepSeek. Your machine, your tokens, your call._
+_Runs on local Ollama (free) or DeepSeek (≈ $0.07–0.12 per deep research run)._
+
+![CI](https://github.com/shaunmarv3/Jarvis/actions/workflows/ci.yml/badge.svg)
 
 </div>
 
@@ -22,218 +25,222 @@ _Runs on local Ollama or DeepSeek. Your machine, your tokens, your call._
 
 ## ✨ What it does
 
-Jarvis is a CLI research assistant that behaves like a relentless research team. Give it a topic or a
-paper, confirm a short plan, and a **lead agent splits the question across parallel subagents** — each
-researching one facet in its own context — then merges and cites their findings into a grounded report.
+Jarvis implements the orchestrator-worker design from Anthropic's
+[*How we built our multi-agent research system*](https://www.anthropic.com/engineering/multi-agent-research-system)
+and its open-sourced [lead / subagent prompts](https://github.com/anthropics/claude-cookbooks/tree/main/patterns/agents/prompts):
 
-- **Multi-agent (orchestrator-worker)** — a **lead agent** decomposes your question into independent
-  sub-questions and fans them out to **subagents**, each with its own context window and tools, then
-  synthesizes their reports and runs a dedicated **citation pass**. (Pattern from Anthropic's
-  [multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system).)
-- **Find ideas & papers** — searches arXiv, Semantic Scholar, OpenAlex & Crossref.
-- **Pull the exact paper** — by title, URL, arXiv ID, or DOI.
-- **Read & explain** — downloads the PDF, parses it, summarizes, explains methods.
-- **Chat with a paper (RAG)** — after `/read`, ask follow-up questions; each paper gets its **own** vector store (`nomic-embed-text` + Chroma) so `/ask` targets one paper and never mixes content. `/db` lists your library; `/forget` deletes one.
-- **Find & inspect datasets** — searches HuggingFace Hub & Papers with Code, and inspects a dataset's columns, row counts, sample rows & README **without downloading it**.
-- **Search the web** — general internet research via DuckDuckGo + clean article extraction (trafilatura).
-- **Relevance-filtered** — embedding-similarity filter drops off-topic papers from results.
-- **Digs like a madman** — each subagent runs a bounded broad→narrow search loop in isolation.
-- **Two brains, switchable** — local **Ollama** (`qwen3.5:9b`) for free/offline, or **DeepSeek** cloud for heavier reasoning.
-- **Asks first** — when your query is vague it asks a couple of **clarifying questions** (pick an option or type your own), then drafts a research brief **and the subagent split** and waits for your "go" before touching any tool. Specific queries skip the questions.
-- **Shows its work & saves it** — streams every subagent and tool call live; persists summaries & reports to disk.
+- **A lead agent that plans like a researcher** — classifies your question
+  (*straightforward / depth-first / breadth-first*), scales the number of subagents to it, and
+  writes each one a full delegation: objective, key questions, source types, tool budget,
+  output format and boundaries.
+- **Subagents that are real agents** — each runs an observe → orient → decide → act loop in its
+  own context: it sees every tool result, runs 2–3 tools **in parallel** per turn, rephrases
+  when results are off-topic, opens the key papers/pages in **full text**, and stops when
+  searches stop finding anything new (or its budget runs out).
+- **Every source type in one run** — papers (arXiv, Semantic Scholar, OpenAlex, Crossref),
+  web (Tavily → Exa → DuckDuckGo), code (GitHub), datasets & models (HuggingFace) and
+  practitioner discussion (Hacker News). The lead mixes them per facet; no separate commands.
+- **Gap-filling** — after the subagents report, the lead reviews the findings against the brief
+  and may dispatch **one** targeted follow-up wave (bounded, so runs always terminate).
+- **Citations that can't be fabricated** — every result gets a source id (`S12`); agents cite ids;
+  the final `[1] [2]` numbering and Sources list are generated **in code from the registry**.
+  Unknown ids are dropped and counted.
+- **Smart model split** — on DeepSeek a strong model (`deepseek-v4-pro`, thinking on) leads and a
+  cheap fast one (`deepseek-flash`) runs the many subagent turns. Every run prints its token
+  usage and estimated cost.
+- **Robust tools** — per-host rate limiting, retry with backoff on 429/5xx, on-disk cache.
+- **Resumable** — runs are checkpointed to SQLite; after a crash or Ctrl+C, `/resume` continues.
+- **Asks first** — vague questions get 1–3 clarifying questions; you approve the plan before any
+  tool runs.
+- **Chat with a paper** — `/read N` summarizes a paper and indexes it in its own vector store;
+  `/ask` answers from that paper only.
+- **Measured** — 56 offline unit tests + CI, and an LLM-judge eval harness using Anthropic's rubric.
 
 ## How it works
 
 ```
-  topic ─► clarify ─┬─vague─► ask ⏸ ─► brief ─┐
-                    └─specific───────────────►├─► plan (lead) ─► confirm ──edit──► (re-plan)
-                                              │      │              ⏸ you
-                                              │      │            approve
-                                              ▼      ▼               │
-                                   splits into N sub-questions       │
-                                                                     ▼
-                        ┌── subagent 1 (own context + tools) ──┐
-                        ├── subagent 2 (own context + tools) ──┤─► synthesize ─► finalize ─► cite ─► report
-                        └── subagent N (own context + tools) ──┘    (merge)      (draft)   (sources)
+  you ─► clarify ─(vague?)─► ask ⏸ ─► brief ─┐
+                                             ▼
+                          plan (LEAD: classify + delegate) ─► confirm ⏸ ──edit──► re-plan
+                                             │ approve
+             ┌───────────────────────────────┼──────────────────────────────┐
+             ▼                               ▼                              ▼
+     subagent 1 (worker model)      subagent 2                     subagent N
+     ┌───────────────────────┐
+     │ think → tools ∥ tools │  ← parallel tool calls, results fed back,
+     │   ↑         ↓         │    full-text reads, budget + novelty stop
+     │   └── read results ───┘
+     └──────────┬────────────┘     every result → shared SOURCE REGISTRY (S1, S2, …)
+                ▼
+     review (LEAD) ──gaps?──► one follow-up wave ──┐
+                └──ok───────────────────────────────┴─► report (LEAD, keeps [S#] tags)
+                                                         ─► cite (code: [S#] → [n] + Sources)
 ```
 
-The lead agent **scales the number of subagents to the question** (1 for a fact, a few for a
-comparison, more for a survey — up to a configurable ceiling). Subagents run **sequentially on local
-Ollama** (one GPU) and **in parallel on DeepSeek** (async API) — same result, the cloud is just faster.
-
-Built on **[LangGraph](https://github.com/langchain-ai/langgraph)**. The orchestrator-worker pattern
-follows Anthropic's _[How we built our multi-agent research
-system](https://www.anthropic.com/engineering/multi-agent-research-system)_ (lead decomposes →
-parallel subagents → synthesize → cite), specialized here for academic sources. The per-subagent
-broad→narrow search loop is adapted from _Ollama Deep Researcher_ (IterDRAG).
+Subagents run **in parallel on DeepSeek** and **sequentially on local Ollama** (one GPU);
+tool calls inside a subagent run in parallel on both. Each run's plan, sources, subagent
+transcripts and report are saved under `data/runs/<run-id>/`.
 
 ## Quick start
 
-### Prerequisites
-
-- **Python 3.12+**
-- **[Ollama](https://ollama.com)** running locally with a tool-calling model:
-  ```bash
-  ollama pull qwen3.5:9b
-  ```
-- _(Optional)_ A **DeepSeek** API key for the cloud backend.
-
-### Install
-
 ```bash
-git clone <your-repo-url> jarvis
-cd jarvis
+git clone https://github.com/shaunmarv3/Jarvis.git jarvis && cd jarvis
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
-
+.venv\Scripts\activate          # Windows   (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
-pip install -e .       # registers the `jarvis` command
-cp .env.example .env   # then edit .env
+pip install -e .                 # registers the `jarvis` command
+cp .env.example .env             # then edit .env
+jarvis                           # or: python -m jarvis
 ```
 
-### Configure (`.env`)
+- **DeepSeek (recommended for quality):** put your key in `.env` → `DEEPSEEK_API_KEY=sk-...`
+  and set `DEFAULT_BACKEND=deepseek` (or switch at runtime with `/backend deepseek`).
+- **Local:** install [Ollama](https://ollama.com) and `ollama pull qwen3.5:9b` (plus
+  `ollama pull nomic-embed-text` for `/ask`).
 
-```ini
-DEFAULT_BACKEND=ollama          # ollama | deepseek
-OLLAMA_MODEL=qwen3.5:9b
-DEEPSEEK_API_KEY=               # only needed for the deepseek backend
+On Windows you can also put the project folder on `PATH` and run `jarvis.bat` from any terminal.
 
-# Multi-agent (orchestrator-worker)
-MAX_SUBAGENTS_OLLAMA=5          # ceiling on local GPU (subagents run sequentially)
-MAX_SUBAGENTS_DEEPSEEK=10       # ceiling on cloud (subagents run in parallel)
-SUBAGENT_ROUNDS=2              # search rounds per subagent (broad → narrowed follow-up)
-PARALLEL_SUBAGENTS=true        # run subagents concurrently (only takes effect on DeepSeek)
-```
+### Models & cost (DeepSeek)
 
-> **On a 4GB GPU:** keep `MAX_SUBAGENTS_OLLAMA` modest — the ceiling is a *patience* limit, not a
-> memory limit (only one subagent is in VRAM at a time), so more subagents just means a longer wait.
-> Raise it when you want deeper research and don't mind waiting; on DeepSeek it runs in parallel.
+| Role | Default model | Why | Price / 1M tokens (peak; off-peak is ½) |
+|---|---|---|---|
+| Lead — plan, review, report | `deepseek-v4-pro` (thinking) | few calls, needs judgment | $1.32 in · $3.96 out |
+| Subagents — tool loops | `deepseek-flash` (no thinking) | many calls, needs speed | $0.30 in · $1.20 out |
 
-### Run
+A deep run is typically **$0.07–0.12** (see the eval table) — a $5 balance is ~50 runs. Change models with
+`DEEPSEEK_LEAD_MODEL` / `DEEPSEEK_WORKER_MODEL`; `/cost` shows the last run's spend.
 
-```bash
-jarvis              # if you ran `pip install -e .` (venv active)
-python -m jarvis    # always works
-```
+### Optional keys (everything works without them)
 
-**Run `jarvis` from any cmd window (Windows):** add the project folder to your `PATH`, or copy
-`jarvis.bat` somewhere already on `PATH` — then just type `jarvis`. The `.bat` calls the venv's
-Python directly, so you don't need to activate the venv first.
+| Key | Effect |
+|---|---|
+| `SEMANTIC_SCHOLAR_API_KEY` | your own 1 req/s lane — the keyless shared pool is often rate-limited (429) |
+| `TAVILY_API_KEY` / `EXA_API_KEY` | LLM-grade web search instead of DuckDuckGo |
+| `GITHUB_TOKEN` | higher GitHub search limits |
 
 ## Usage
 
 ```text
-> rag eval
+> how are RAG systems evaluated in research and in production?
 
-   ? What kind of evaluation matters most?
-     1) Retrieval quality   2) Faithfulness / hallucination   3) Task success
-     (or type your own · Enter/0 to skip)
-   > 2
+  research brief (breadth_first)
+  Plan — 3 subagent(s):
+    1. Academic RAG evaluation metrics & benchmarks       sources: academic, code · budget 8
+    2. How production teams evaluate & monitor RAG        sources: web, community · budget 7
+    3. Open-source evaluation frameworks compared         sources: code, web · budget 6
+  Proceed? [Y/edit/n] y
 
-   Brief: Survey recent work on evaluating RAG systems, focused on answer
-            faithfulness & hallucination. Tools: arXiv, Semantic Scholar, OpenAlex.
+  · dispatching 3 subagent(s) [parallel]
+  → subagent [1/3] Academic RAG evaluation metrics & benchmarks · budget 8
+      [1/3] search_arxiv(query=RAG evaluation metrics)
+      [1/3] search_semantic_scholar(query=RAG evaluation benchmark)
+      [2/3] search_web(query=RAG evaluation in production)
+      [1/3] read_paper(paper=S4, focus=faithfulness metric definition)
+  ↳ subagent [1/3] done · 8 searches + 3 reads · 30 sources
+  ⠋ lead reviewing findings for gaps… 4m 12s · $0.061 so far        ← live spinner
+  · lead found gaps → 1 follow-up subagent(s): RAGChecker primary source & metrics
+  · lead wrote the report
+  · citations attached
 
-   Plan — 4 subagent(s): 1. faithfulness metrics  2. hallucination detection  …
-     Proceed? [Y/edit/n] y
-
-   · subagents researching …   · merging findings …   · compiling report …
-   Report ready — 12 papers cited.
-
-> /read 1          # downloads + summarizes + indexes the first result
-> /ask 1 what metric does it propose?
-> /backend deepseek
-> find datasets for question answering over scientific papers
+  ╭─ report ─────────────────────────────────────────────────╮
+  │ # How RAG systems are evaluated …  [1][2] … ## Sources   │
+  ╰──────────────────────────────────────────────────────────╯
+  ┌──────────────────────── run summary ─────────────────────────┐
+  │ cost        $0.097  (estimated at peak rates; off-peak is half)
+  │   lead      $0.067 · 4 calls · 13.6k in / 12.6k out (deepseek-v4-pro)
+  │   subagents $0.030 · 24 calls · 146.1k in / 7.8k out (deepseek-flash)
+  │ time        7m 31s
+  │ research    4 subagents · 49 tool calls · depth_first
+  │ sources     43 cited of 150 retrieved
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-A *specific* query (`summarize arXiv 2309.15217`) skips the questions and goes straight to the brief.
+| Command | Action |
+|---|---|
+| `<free text>` | research anything — clarify → plan → confirm → research → report |
+| `/papers` · `/sources` | the last run's papers (cited first) · every source it retrieved |
+| `/read <N>` · `/ask [N] <q>` | summarize + index a paper · ask questions about one indexed paper |
+| `/db` · `/use <N>` · `/forget <N>` | manage the paper vector library |
+| `/save <N>` | download paper N's PDF |
+| `/resume` | continue the last run after a crash / Ctrl+C |
+| `/cost` | token usage & estimated cost of the last run |
+| `/dataset <q>` · `/inspect <id>` · `/web <q>` | quick one-off lookups |
+| `/backend ollama\|deepseek` · `/model <name>` | switch brains |
 
-### Commands
+## Evals
 
-| Command                       | Action                                                       |
-| ----------------------------- | ------------------------------------------------------------ |
-| `<free text>`                 | Ask the agent anything; it plans, confirms, then researches  |
-| `/read <N>`                   | Download, summarize & index paper _N_ into its **own** vector store (summary saved) |
-| `/db`                         | List papers in the vector DB (each stored in a separate folder) |
-| `/ask <question>`             | Ask a question — pick **which** indexed paper to query (no mixing) |
-| `/use <N>`                    | Select DB paper _N_ as the target for `/ask`                 |
-| `/forget <N>`                 | Delete DB paper _N_'s vectors                                 |
-| `/save <N>`                   | Download paper _N_'s PDF to `data/papers`                    |
-| `/papers`                     | List this session's search results                           |
-| `/dataset <query>`            | Search HuggingFace + Papers with Code datasets               |
-| `/inspect <hub_id>`           | Inspect a dataset (cols, rows, sample, README), e.g. `/inspect squad` |
-| `/web <query>`                | Quick web search (DuckDuckGo)                                |
-| `/backend [ollama\|deepseek]` | Switch the LLM brain at runtime                              |
-| `/model <name>`               | Switch the Ollama model                                      |
-| `/help`                       | Show commands                                                |
-| `/quit`                       | Exit                                                         |
+`evals/run_evals.py` runs benchmark queries headlessly and grades each report with a single
+LLM-judge call on Anthropic's rubric — **factual accuracy, citation accuracy, completeness,
+source quality, tool efficiency** (0–1 each) — plus code-computed checks (truncation, dangling
+citations, cost). It can also grade an older checkout, which is how the table below compares
+this version against the previous one.
 
-> 💡 Type `/` and a **live dropdown** of commands appears below the cursor (with descriptions),
-> filtered as you type — like Claude Code. Powered by `prompt_toolkit`.
+```bash
+python evals/run_evals.py --backend deepseek --limit 4
+python evals/run_evals.py --jarvis-path ../old-checkout --label baseline
+```
 
-## Tools & data sources
+| version | factual accuracy | citation accuracy | completeness | source quality | tool efficiency | **overall** | pass | truncated reports | avg citations | avg time | avg cost |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| previous (`main`) | 0.49 | 0.41 | 0.55 | 0.45 | 0.64 | **0.51** | 2/4 | 2 | 17 | 185 s | — |
+| **this version** | **0.81** | **0.78** | **0.89** | **0.67** | **0.86** | **0.80** | **4/4** | **0** | 48 | 401 s | $0.087 |
 
-| Source                                                                         | Use                               | Cost         |
-| ------------------------------------------------------------------------------ | --------------------------------- | ------------ |
-| [arXiv](https://info.arxiv.org/help/api/)                                      | Preprint search + exact PDF fetch | Free, no key |
-| [Semantic Scholar](https://www.semanticscholar.org/product/api)                | Search, citations, title resolve  | Free, no key |
-| [OpenAlex](https://openalex.org)                                               | 250M+ works, citation graph       | Free, no key |
-| [Crossref](https://www.crossref.org/documentation/retrieve-metadata/rest-api/) | DOI / metadata resolve            | Free         |
-| [HuggingFace Hub](https://huggingface.co/datasets)                             | Dataset search                    | Free         |
-| [HF datasets-server](https://huggingface.co/docs/datasets-server)              | Dataset schema / rows / size      | Free, no key |
-| [Papers with Code](https://paperswithcode.com)                                 | Dataset / benchmark search        | Free         |
-| [DuckDuckGo (ddgs)](https://github.com/deedy5/ddgs)                            | Web search                        | Free, no key |
-| [trafilatura](https://trafilatura.readthedocs.io)                              | Web page text extraction          | Free         |
-| [Chroma](https://www.trychroma.com) + nomic-embed                              | Local vector store for paper Q&A  | Free, local  |
+Run 2026-10-02 on DeepSeek, 4 queries (`rag-eval, agent-bench, lora-qlora, vector-db`), same judge
+(`deepseek-v4-pro`) for both versions. The previous version's failures were exactly the ones the
+rebuild targets: off-topic sources (SVM, protein folding, sign language papers in a vector-DB
+report), claims its sources didn't support, and truncated reports. Caveats: 4 queries is a small
+sample, the judge is from the same model family as the agent (possible self-preference), and
+re-judging the same report moves scores by about ±0.05. Weakest criterion now: **source quality**
+(vendor/SEO blogs still get cited) — the next thing to improve (e.g. Tavily/Exa search, a domain
+quality prior).
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q          # 56 tests, no network, no LLM (fake models + fake tools)
+python scripts/smoke.py deepseek "your question"   # one real end-to-end run
+```
+
+Covered: the subagent loop (results fed back, parallel tools, budget, fallback, source-id
+resolution, failure handling), the source registry & deterministic citations, plan validation,
+the follow-up wave, the full graph end-to-end, HTTP retry/cache/rate-limit, every tool's offline
+behavior, DeepSeek thinking-mode payloads, and cost accounting.
 
 ## Project structure
 
 ```
 jarvis/
-├── jarvis/
-│   ├── config.py          # settings + backend switch + subagent ceilings + paths
-│   ├── llm.py             # get_llm() → Ollama | DeepSeek
-│   ├── embeddings.py      # nomic-embed + relevance ranking
-│   ├── store.py           # Chroma vector store (paper chunks)
-│   ├── qa.py              # chat-with-paper RAG + summary persistence
-│   ├── state.py           # LangGraph AgentState
-│   ├── graph.py           # graph assembly
-│   ├── nodes.py           # clarify / ask / brief / plan(lead) / confirm / fanout / synthesize / finalize / cite
-│   ├── subagent.py        # isolated per-subagent broad→narrow research loop
-│   ├── events.py          # live-progress sink (subagents stream to the CLI)
-│   ├── prompts.py         # prompt templates
-│   ├── tools/             # arxiv, semantic_scholar, openalex, crossref,
-│   │                      #   pdf_reader, datasets, hf_inspect, web
-│   ├── banner.py          # JARVIS ASCII banner (holographic gradient)
-│   ├── repl.py            # prompt_toolkit input + live /command dropdown
-│   └── cli.py             # Rich REPL
-├── data/                  # git-ignored
-│   ├── papers/            # downloaded PDFs
-│   ├── summaries/         # saved paper summaries (markdown)
-│   ├── reports/           # saved research reports (markdown)
-│   └── vectorstore/       # one folder per paper: <slug>__<HHMMSSmmm>/ + registry.json
-├── pyproject.toml         # `jarvis` console entry point
-├── jarvis.bat             # run `jarvis` from any cmd (Windows)
-├── requirements.txt
-├── .gitignore             # ignores .venv/, data/, .env, __pycache__/ …
-├── .env.example
-├── README.md
-└── info.md                # full project knowledge dump
+├── config.py        settings: lead/worker models, prices, budgets, optional keys
+├── llm.py           get_llm(role=lead|worker) · DeepSeek thinking fix · usage/cost tracker
+├── graph.py         LangGraph flow + SQLite checkpointer
+├── nodes.py         clarify / plan (lead) / confirm / fanout / review / followup / report / cite
+├── subagent.py      the agentic tool loop for one delegated task
+├── sources.py       source registry + deterministic citations
+├── prompts.py       lead / subagent / review / report prompts (after Anthropic's cookbook)
+├── headless.py      run a research request without a human (smoke tests, evals)
+├── tools/
+│   ├── _http.py     rate limiting · retries · disk cache
+│   ├── arxiv_tool.py  semantic_scholar.py  openalex.py  crossref.py
+│   ├── reader.py    full-text paper reading with focused passage selection
+│   ├── web.py       Tavily → Exa → DuckDuckGo · page reading
+│   ├── github.py  hf_models.py  datasets.py  hf_inspect.py  community.py
+│   └── pdf_reader.py  (map-reduce paper summaries for /read)
+├── store.py · qa.py · embeddings.py   per-paper vector stores & Q&A
+└── cli.py · repl.py · banner.py       the terminal UI
+evals/   queries.jsonl · judge.py · run_evals.py · results/
+tests/   offline unit + integration tests
 ```
 
 ## Roadmap
 
-- [x] **Phase 1** — paper search/fetch, read/summarize, dataset search, reflect loop, dual backend.
-- [x] **Phase 2** — chat-with-paper RAG (`nomic-embed-text` + Chroma), dataset inspection, web search, relevance filter, live tool view, persistence.
-- [x] **Phase 3** — multi-agent **orchestrator-worker**: lead agent decomposes → parallel/sequential subagents with isolated contexts → synthesize → dedicated citation pass (backend-aware execution).
-- [ ] **Phase 4** — chat across _all_ saved papers, Streamlit web UI, Kaggle search, citation-graph exploration, optional Scrapling/Playwright web booster, LLM-judge eval harness.
+- [x] Phase 1–3 — search/fetch/read, RAG chat, datasets, multi-agent orchestrator-worker.
+- [x] **Phase 4** — real agentic subagents, lead classification + rich delegations, gap-filling
+  wave, all source types in one run, grounded citations, lead/worker model split + cost
+  tracking, resumable runs, tests + CI, eval harness.
+- [ ] Next — chat across *all* saved papers, citation-graph exploration (references/cited-by),
+  Streamlit UI, MCP server, Reddit via authenticated API.
 
 ## License
 
-MIT — personal hobby project.
-
----
-
-<div align="center"><sub>Built for the joy of research. Powered by LangGraph + Ollama/DeepSeek.</sub></div>
+MIT — personal project.

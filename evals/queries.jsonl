@@ -1,0 +1,8 @@
+{"id": "rag-eval", "query": "How are RAG systems evaluated, both in academic research and in production teams?", "expects": ["papers", "web"]}
+{"id": "agent-bench", "query": "What datasets and benchmarks exist for evaluating LLM agents' tool use, and which are most used?", "expects": ["papers", "datasets"]}
+{"id": "lora-qlora", "query": "Compare LoRA and QLoRA for fine-tuning an LLM on a single 8GB consumer GPU: quality, memory, and tooling.", "expects": ["papers", "code"]}
+{"id": "long-context", "query": "What techniques are used to extend LLM context windows beyond the pretraining length, and how well do they work?", "expects": ["papers"]}
+{"id": "vector-db", "query": "Which open-source vector databases do practitioners prefer for RAG in 2026 and why?", "expects": ["web", "code", "community"]}
+{"id": "pull-exact", "query": "Summarize the paper 'Ragas: Automated Evaluation of Retrieval Augmented Generation' (arXiv 2309.15217).", "expects": ["papers"]}
+{"id": "hallucination", "query": "What are the most effective methods to detect hallucinations in LLM outputs without a reference answer?", "expects": ["papers", "code"]}
+{"id": "small-models", "query": "Which small open LLMs (under 10B parameters) are best at tool calling, according to benchmarks?", "expects": ["papers", "models", "web"]}

@@ -1,12 +1,23 @@
-"""arXiv search + exact-paper fetch (free, no key)."""
+"""arXiv search + exact-paper fetch (free, no key).
+
+Talks to the Atom API directly through the shared rate-limited/cached HTTP layer
+(arXiv asks for <= 1 request every 3 s; the old per-call client ignored that across
+parallel subagents and got HTTP 429s).
+"""
 
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
+
+import requests
 
 from ..config import PAPERS_DIR, settings
 from ..utils import truncate
+from . import _http
 
+_API = "https://export.arxiv.org/api/query"
+_NS = {"a": "http://www.w3.org/2005/Atom"}
 _ARXIV_ID = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?")
 
 
@@ -17,38 +28,53 @@ def _clean_id(id_or_url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _to_paper(r) -> dict:
-    aid = r.get_short_id().split("v")[0]
-    return {
-        "source": "arxiv",
-        "id": aid,
-        "title": (r.title or "").strip().replace("\n", " "),
-        "authors": [a.name for a in r.authors][:8],
-        "year": r.published.year if r.published else None,
-        "abstract": (r.summary or "").strip().replace("\n", " "),
-        "url": r.entry_id,
-        "pdf_url": r.pdf_url,
-    }
+def _text(el, path: str) -> str:
+    node = el.find(path, _NS)
+    return re.sub(r"\s+", " ", node.text or "").strip() if node is not None else ""
+
+
+def _parse(feed: str) -> list[dict]:
+    root = ET.fromstring(feed)
+    papers = []
+    for e in root.findall("a:entry", _NS):
+        entry_id = _text(e, "a:id")
+        aid = _clean_id(entry_id)
+        if not aid:
+            continue
+        published = _text(e, "a:published")
+        papers.append(
+            {
+                "source": "arxiv",
+                "id": aid,
+                "title": _text(e, "a:title"),
+                "authors": [_text(a, "a:name") for a in e.findall("a:author", _NS)][:8],
+                "year": int(published[:4]) if published[:4].isdigit() else None,
+                "abstract": _text(e, "a:summary"),
+                "url": f"https://arxiv.org/abs/{aid}",
+                "pdf_url": f"https://arxiv.org/pdf/{aid}",
+            }
+        )
+    return papers
 
 
 def arxiv_search(query: str, max_results: int = 5) -> dict:
     """Search arXiv; returns {'papers': [...], 'text': ...}."""
     try:
-        import arxiv
-
-        client = arxiv.Client(page_size=max_results, delay_seconds=1, num_retries=2)
-        search = arxiv.Search(
-            query=query,
-            max_results=max_results,
-            sort_by=arxiv.SortCriterion.Relevance,
+        feed = _http.get(
+            _API,
+            params={
+                "search_query": f"all:{query}",
+                "max_results": max(1, min(int(max_results), 20)),
+                "sortBy": "relevance",
+            },
+            as_json=False,
         )
-        papers = [_to_paper(r) for r in client.results(search)]
+        papers = _parse(feed)
     except Exception as exc:  # network / parse issues degrade gracefully
         return {"papers": [], "text": f"arXiv search failed: {exc}"}
 
     if not papers:
-        return {"papers": [], "text": f"No arXiv results for '{query}'."}
-
+        return {"papers": [], "text": f"No arXiv results for '{query}'. Try broader keywords."}
     lines = [
         f"- {p['title']} ({p['year']}) [arXiv:{p['id']}] — {truncate(p['abstract'], 200)}"
         for p in papers
@@ -62,21 +88,21 @@ def arxiv_fetch(id_or_url: str, download: bool = True) -> dict:
     if not aid:
         return {"papers": [], "text": f"Could not parse an arXiv id from '{id_or_url}'."}
     try:
-        import arxiv
-
-        client = arxiv.Client()
-        r = next(client.results(arxiv.Search(id_list=[aid])))
-        paper = _to_paper(r)
+        papers = _parse(_http.get(_API, params={"id_list": aid}, as_json=False))
+        if not papers:
+            return {"papers": [], "text": f"arXiv has no paper {aid}."}
+        paper = papers[0]
         if download:
             path = PAPERS_DIR / f"{aid}.pdf"
             if not path.exists():
-                r.download_pdf(dirpath=str(PAPERS_DIR), filename=f"{aid}.pdf")
+                resp = requests.get(
+                    paper["pdf_url"], timeout=settings.request_timeout * 2,
+                    headers={"User-Agent": _http.UA},
+                )
+                resp.raise_for_status()
+                path.write_bytes(resp.content)
             paper["local_path"] = str(path)
     except Exception as exc:
         return {"papers": [], "text": f"arXiv fetch failed for {aid}: {exc}"}
 
     return {"papers": [paper], "text": f"Fetched arXiv:{aid} — {paper['title']}"}
-
-
-# Avoid an unused-import warning for settings while keeping it importable here.
-_ = settings.request_timeout

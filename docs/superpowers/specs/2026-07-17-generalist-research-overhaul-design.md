@@ -1,7 +1,7 @@
 # Jarvis — Generalist Deep-Research Overhaul (Phase 4) — Design Spec
 
 **Date:** 2026-07-17
-**Status:** Approved design, pending implementation plan
+**Status:** Implemented 2026-10-02 on branch `feat/anthropic-grade-agent` (see "Implementation notes" at the end)
 **Owner:** Shaun (hobby project, resume-grade upgrade)
 
 ## 1. Goals & motivation
@@ -276,3 +276,29 @@ deprecated alias for one release of the .env file, i.e., ignored with a note).
 5. Eval harness runs headless over all benchmark queries and produces the
    README score table.
 6. Zero-key install still works end-to-end (ddgs fallback, keyless GitHub/HN/Reddit/HF).
+
+## 11. Implementation notes (2026-10-02)
+
+Built as specified, with these deviations — each forced by something found while building or testing:
+
+- **The subagent loop was the real root cause.** Before adding sources, the subagent was rebuilt
+  into a true tool loop: the old code never fed tool results back to the model (each round was a
+  fresh single call), so "more tools" alone would not have helped.
+- **Citations are deterministic, not an LLM pass.** Every result is registered as `S#`; agents cite
+  ids; `sources.finalize_citations` renumbers and builds the Sources list from the registry. The old
+  LLM citation rewrite truncated every saved report (Ollama `num_predict=1024`) and invented names.
+- **Source kinds:** `academic | web | datasets | code | community` (models are folded into
+  `datasets`). **Reddit is not offered to agents** — it now answers anonymous clients with HTTP 403;
+  `search_reddit` stays in `TOOL_FUNCS` for when authenticated access is added.
+- **Papers with Code removed** — shut down July 2025.
+- **Budgets:** searches and full-text reads are budgeted separately (`subagent_max_reads=3`); in the
+  first live run subagents spent their whole budget on one burst of parallel searches and never read
+  a source. Novelty stop = two consecutive turns with no new sources → nudge to finish.
+- **Lead/worker model split on DeepSeek** (`deepseek-v4-pro` lead with thinking at `reasoning_effort=low`,
+  `deepseek-flash` workers without thinking). At effort `high` the lead spent its whole output budget
+  on reasoning and returned an empty report; the report node now retries without thinking if empty.
+  langchain-deepseek drops `reasoning_content`, which thinking-mode tool loops must echo back
+  (HTTP 400 otherwise) — fixed in `llm._deepseek_class`.
+- **Additions not in the spec:** per-host rate limiting + retries + disk cache (`tools/_http.py`),
+  full-text paper reading with BM25 passage selection (`tools/reader.py`), SQLite checkpoints +
+  `/resume`, `/sources`, `/cost`, per-run artifacts in `data/runs/<id>/`, token/cost tracking.
