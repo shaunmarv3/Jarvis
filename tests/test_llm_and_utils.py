@@ -50,20 +50,6 @@ def test_usage_tracker_cost():
     assert "lead 1 calls" in t.summary()
 
 
-def test_relevance_filter_never_returns_junk(monkeypatch):
-    from jarvis import embeddings
-
-    class Emb:
-        def embed_query(self, q):
-            return [1.0, 0.0]
-
-        def embed_documents(self, docs):
-            return [[0.0, 1.0] for _ in docs]  # everything orthogonal = off-topic
-
-    monkeypatch.setattr(embeddings, "get_embeddings", lambda: Emb())
-    assert embeddings.rank_by_relevance("q", [{"title": "SPIKES protocol"}], 5, 0.6) == []
-
-
 def test_extract_json_variants():
     assert extract_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert extract_json('Sure! {"a": {"b": 2}} hope that helps') == {"a": {"b": 2}}

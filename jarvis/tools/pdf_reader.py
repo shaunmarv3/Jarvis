@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import re
 
-import requests
-
-from ..config import PAPERS_DIR, settings
-from ..llm import get_llm
-from ..utils import chunk_text
+from ..config import PAPERS_DIR
+from ..llm import get_llm, input_char_budget
+from ..utils import chunk_text, truncate
 
 _CHUNK_PROMPT = (
     "You are summarizing one section of the research paper titled '{title}'.\n"
@@ -35,8 +33,10 @@ def _safe_name(s: str) -> str:
 
 
 def _ensure_pdf(paper: dict) -> str | None:
-    """Return a local PDF path, downloading if needed. None if unavailable."""
-    if paper.get("local_path"):
+    """Return a local PDF path, downloading if needed. None if unavailable or not a real PDF."""
+    from .reader import is_pdf, save_pdf
+
+    if paper.get("local_path") and is_pdf(paper["local_path"]):
         return paper["local_path"]
 
     # arXiv papers: use the dedicated fetcher (handles ids cleanly).
@@ -52,17 +52,8 @@ def _ensure_pdf(paper: dict) -> str | None:
         return None
     name = _safe_name(paper.get("id") or paper.get("title") or "paper") + ".pdf"
     path = PAPERS_DIR / name
-    if path.exists():
-        return str(path)
     try:
-        resp = requests.get(
-            url,
-            timeout=settings.request_timeout,
-            headers={"User-Agent": "jarvis-research-agent"},
-        )
-        resp.raise_for_status()
-        path.write_bytes(resp.content)
-        return str(path)
+        return str(path) if save_pdf(url, path) else None  # HTML / paywall pages are rejected
     except Exception:
         return None
 
@@ -102,6 +93,13 @@ def summarize_paper(paper: dict, backend: str | None = None, max_chunks: int = 8
     if len(parts) == 1:
         briefing = parts[0]
     else:
+        # 8 section summaries can outgrow a local model's window; share it out evenly
+        # instead of letting the server cut the prompt (which would drop the instructions).
+        budget = input_char_budget(backend, 1500)
+        if budget is not None:
+            room = budget - len(_COMBINE_PROMPT) - len(title)
+            share = max(300, room // len(parts) - 2)
+            parts = [truncate(p, share) for p in parts]
         try:
             briefing = llm.invoke(
                 _COMBINE_PROMPT.format(title=title, parts="\n\n".join(parts))

@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
+
+
+def write_json_atomic(path, data: Any, indent: int | None = 2) -> None:
+    """Write JSON so a crash can never leave a half-written file: write a temp file in the
+    same folder, then swap it in with an atomic rename."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=indent, default=str)
+    os.replace(tmp, path)
 
 
 def extract_json(text: str) -> dict[str, Any]:

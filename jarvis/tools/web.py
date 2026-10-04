@@ -1,4 +1,4 @@
-"""General web research: search (ddgs) + read/extract a page (scrapling → fallbacks)."""
+"""General web research: search (Tavily → Exa → DuckDuckGo) + read/extract a page."""
 
 from __future__ import annotations
 
@@ -8,42 +8,44 @@ import requests
 
 from ..config import settings
 from ..utils import truncate
+from . import _http
 
 _UA = "Mozilla/5.0 (compatible; jarvis-research-agent/0.1)"
 
 
 def _tavily(query: str, n: int) -> list[dict]:
-    resp = requests.post(
+    # Through the shared layer: retries, rate limiting and the disk cache (saves paid credits).
+    data = _http.post(
         "https://api.tavily.com/search",
-        json={"query": query, "max_results": n, "search_depth": "basic"},
+        {"query": query, "max_results": n, "search_depth": "basic"},
         headers={"Authorization": f"Bearer {settings.tavily_api_key}"},
-        timeout=settings.request_timeout,
     )
-    resp.raise_for_status()
     return [
         {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")}
-        for r in resp.json().get("results", [])
+        for r in data.get("results", [])
     ]
 
 
 def _exa(query: str, n: int) -> list[dict]:
-    resp = requests.post(
+    data = _http.post(
         "https://api.exa.ai/search",
-        json={"query": query, "numResults": n, "contents": {"text": {"maxCharacters": 800}}},
+        {"query": query, "numResults": n, "contents": {"text": {"maxCharacters": 800}}},
         headers={"x-api-key": settings.exa_api_key},
-        timeout=settings.request_timeout,
     )
-    resp.raise_for_status()
     return [
         {"title": r.get("title") or r.get("url", ""), "url": r.get("url", ""), "snippet": (r.get("text") or "")[:800]}
-        for r in resp.json().get("results", [])
+        for r in data.get("results", [])
     ]
 
 
 def _ddgs(query: str, n: int) -> list[dict]:
     from ddgs import DDGS
 
-    with DDGS() as d:
+    try:
+        client = DDGS(timeout=settings.request_timeout)
+    except TypeError:  # older ddgs without a timeout argument
+        client = DDGS()
+    with client as d:
         raw = list(d.text(query, max_results=n))
     return [
         {"title": r.get("title", ""), "url": r.get("href") or r.get("url", ""), "snippet": r.get("body") or r.get("snippet", "")}

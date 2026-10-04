@@ -73,9 +73,15 @@ class Settings(BaseSettings):
     max_followup_subagents: int = 2
     report_max_tokens: int = 4096  # the final report must never be cut off mid-sentence
 
+    # Time limits — every loop is already bounded by counts; these bound it by the clock.
+    tool_timeout: int = 90  # seconds one tool call may run inside a subagent before it's abandoned
+    wave_time_limit_min: float = 15  # minutes for one wave of subagents (0 = none); then each writes up what it has
+
+    # Eval ablation: one subagent gets the whole plan (all key questions + sources) instead of several.
+    single_agent: bool = False
+
     # Embeddings / RAG (paper Q&A — needs Ollama for nomic-embed-text)
     embed_model: str = "nomic-embed-text"
-    relevance_min: float = 0.60  # cosine cutoff (calibrated: on-topic >=0.62, off-topic <=0.58)
     keep_top_papers: int = 12  # papers listed for /read after a run
 
     # Web research

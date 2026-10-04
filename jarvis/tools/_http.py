@@ -17,9 +17,10 @@ from urllib.parse import urlparse
 
 import requests
 
+from .. import __version__
 from ..config import CACHE_DIR, settings
 
-UA = "jarvis-research-agent/0.3 (+https://github.com)"
+UA = f"jarvis-research-agent/{__version__} (+https://github.com/shaunmarv3/Jarvis)"
 
 # Minimum seconds between requests to the same host.
 _MIN_INTERVAL = {
@@ -57,15 +58,17 @@ def _wait_turn(host: str) -> None:
         _last[host] = time.monotonic()
 
 
-def _cache_path(url: str, params: dict | None):
-    key = json.dumps([url, sorted((params or {}).items())], default=str)
+def _cache_path(url: str, params: dict | None, body: dict | None = None):
+    # GET keys stay [url, params] so existing cache files remain valid; POST adds its JSON body.
+    parts = [url, sorted((params or {}).items())] + ([body] if body is not None else [])
+    key = json.dumps(parts, default=str, sort_keys=True)
     return CACHE_DIR / (hashlib.sha256(key.encode()).hexdigest()[:32] + ".json")
 
 
-def _cache_get(url: str, params: dict | None):
+def _cache_get(url: str, params: dict | None, body: dict | None = None):
     if settings.tool_cache_hours <= 0:
         return None
-    p = _cache_path(url, params)
+    p = _cache_path(url, params, body)
     try:
         if p.exists() and time.time() - p.stat().st_mtime < settings.tool_cache_hours * 3600:
             return json.loads(p.read_text(encoding="utf-8"))["body"]
@@ -74,49 +77,53 @@ def _cache_get(url: str, params: dict | None):
     return None
 
 
-def _cache_put(url: str, params: dict | None, body) -> None:
+def _cache_put(url: str, params: dict | None, body, json_body: dict | None = None) -> None:
     if settings.tool_cache_hours <= 0:
         return
     try:
-        _cache_path(url, params).write_text(json.dumps({"url": url, "body": body}), encoding="utf-8")
+        _cache_path(url, params, json_body).write_text(json.dumps({"url": url, "body": body}), encoding="utf-8")
     except Exception:
         pass
 
 
-def get(
+def _request(
+    method: str,
     url: str,
     params: dict | None = None,
+    json_body: dict | None = None,
     headers: dict | None = None,
     as_json: bool = True,
     retries: int = 3,
     cache: bool = True,
     timeout: int | None = None,
 ):
-    """GET with rate limiting, retries and caching. Returns parsed JSON or text.
+    """One rate-limited, retried, cached request. Returns parsed JSON or text.
 
     Raises HTTPError with an actionable message when all attempts fail.
     """
     if cache:
-        hit = _cache_get(url, params)
+        hit = _cache_get(url, params, json_body)
         if hit is not None:
             return hit
 
     host = urlparse(url).netloc
     hdrs = {"User-Agent": UA, **(headers or {})}
+    send = requests.post if method == "POST" else requests.get
     last_err = ""
     for attempt in range(retries + 1):
         _wait_turn(host)
         try:
-            resp = requests.get(
-                url, params=params, headers=hdrs, timeout=timeout or settings.request_timeout
-            )
+            kwargs = {"params": params, "headers": hdrs, "timeout": timeout or settings.request_timeout}
+            if json_body is not None:
+                kwargs["json"] = json_body
+            resp = send(url, **kwargs)
         except requests.RequestException as exc:
             last_err = f"network error: {exc}"
         else:
             if resp.status_code == 200:
                 body = resp.json() if as_json else resp.text
                 if cache:
-                    _cache_put(url, params, body)
+                    _cache_put(url, params, body, json_body)
                 return body
             last_err = f"HTTP {resp.status_code}"
             if resp.status_code not in (429, 500, 502, 503, 504):
@@ -131,3 +138,17 @@ def get(
 
     hint = " (rate-limited — try again shortly or use a different source)" if "429" in last_err else ""
     raise HTTPError(f"{host}: {last_err}{hint}")
+
+
+def get(url: str, params: dict | None = None, headers: dict | None = None, as_json: bool = True,
+        retries: int = 3, cache: bool = True, timeout: int | None = None):
+    """GET with rate limiting, retries and caching."""
+    return _request("GET", url, params=params, headers=headers, as_json=as_json,
+                    retries=retries, cache=cache, timeout=timeout)
+
+
+def post(url: str, json_body: dict, headers: dict | None = None, as_json: bool = True,
+         retries: int = 3, cache: bool = True, timeout: int | None = None):
+    """POST a JSON body with the same rate limiting, retries and caching (search APIs)."""
+    return _request("POST", url, json_body=json_body, headers=headers, as_json=as_json,
+                    retries=retries, cache=cache, timeout=timeout)

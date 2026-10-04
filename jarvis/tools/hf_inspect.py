@@ -9,13 +9,10 @@ Plus the Hub for the README (dataset card).
 
 from __future__ import annotations
 
-import requests
-
-from ..config import settings
 from ..utils import truncate
+from . import _http
 
 _DS = "https://datasets-server.huggingface.co"
-_UA = "jarvis-research-agent"
 
 
 _canon_cache: dict[str, str] = {}
@@ -26,13 +23,9 @@ def _canonical(dataset: str) -> str:
     if dataset in _canon_cache:
         return _canon_cache[dataset]
     try:
-        r = requests.get(
-            f"{_DS}/is-valid", params={"dataset": dataset},
-            timeout=settings.request_timeout, headers={"User-Agent": _UA},
-        )
-        if r.status_code == 200:
-            _canon_cache[dataset] = dataset
-            return dataset
+        _http.get(f"{_DS}/is-valid", params={"dataset": dataset}, retries=1)  # raises unless HTTP 200
+        _canon_cache[dataset] = dataset
+        return dataset
     except Exception:
         pass
     # Fall back to a Hub search for the bare name.
@@ -50,12 +43,7 @@ def _canonical(dataset: str) -> str:
 
 def _get(path: str, params: dict) -> dict | None:
     try:
-        r = requests.get(
-            f"{_DS}/{path}", params=params, timeout=settings.request_timeout,
-            headers={"User-Agent": _UA},
-        )
-        r.raise_for_status()
-        return r.json()
+        return _http.get(f"{_DS}/{path}", params=params)
     except Exception:
         return None
 
@@ -64,9 +52,7 @@ def dataset_readme(dataset: str) -> dict:
     """Fetch the dataset card (README.md) text from the Hub."""
     try:
         url = f"https://huggingface.co/datasets/{dataset}/raw/main/README.md"
-        r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": _UA})
-        r.raise_for_status()
-        text = r.text
+        text = _http.get(url, as_json=False)
         # Strip YAML front-matter for readability.
         if text.startswith("---"):
             parts = text.split("---", 2)

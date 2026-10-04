@@ -6,6 +6,7 @@ abstract — without flooding a small model's context window.
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections import Counter
 
@@ -80,19 +81,40 @@ def _pdf_text(path: str) -> str:
     return text
 
 
+def is_pdf(path) -> bool:
+    """True if the file starts like a PDF (a paywall or error page saved as .pdf does not)."""
+    try:
+        with open(path, "rb") as f:
+            return b"%PDF" in f.read(1024)
+    except OSError:
+        return False
+
+
+def save_pdf(url: str, path) -> bool:
+    """Download `url` to `path` only if the response really is a PDF.
+
+    An existing valid file is reused; an existing non-PDF file (saved by older versions)
+    is replaced. Returns False for HTML / paywall responses. Network errors raise.
+    """
+    if os.path.exists(path):
+        if is_pdf(path):
+            return True
+        os.remove(path)
+    resp = requests.get(url, timeout=settings.request_timeout * 2, headers={"User-Agent": _http.UA})
+    resp.raise_for_status()
+    if b"%PDF" not in resp.content[:1024]:
+        return False
+    with open(path, "wb") as f:
+        f.write(resp.content)
+    return True
+
+
 def _download_pdf(url: str) -> str | None:
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", url.split("://", 1)[-1])[:100]
     if not name.endswith(".pdf"):
         name += ".pdf"
     path = PAPERS_DIR / name
-    if path.exists():
-        return str(path)
-    resp = requests.get(url, timeout=settings.request_timeout * 2, headers={"User-Agent": _http.UA})
-    resp.raise_for_status()
-    if b"%PDF" not in resp.content[:1024]:
-        return None
-    path.write_bytes(resp.content)
-    return str(path)
+    return str(path) if save_pdf(url, path) else None
 
 
 def _s2_open_pdf(doi: str) -> tuple[str | None, str]:

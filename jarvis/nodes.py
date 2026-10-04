@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
@@ -22,12 +24,21 @@ from langgraph.types import interrupt
 
 from .config import REPORTS_DIR, RUNS_DIR, default_budget, lead_iteration_enabled, settings, subagent_ceiling
 from .events import emit
-from .llm import get_llm
-from .prompts import BRIEF_PROMPT, CLARIFY_PROMPT, PLAN_PROMPT, REPORT_PROMPT, REVIEW_PROMPT
+from .llm import get_llm, input_char_budget
+from .prompts import (
+    BRIEF_PROMPT,
+    CLARIFY_PROMPT,
+    PLAN_PROMPT,
+    PRIOR_FOR_CLARIFY,
+    PRIOR_FOR_PLAN,
+    PRIOR_FOR_REPORT,
+    REPORT_PROMPT,
+    REVIEW_PROMPT,
+)
 from .sources import SourceRegistry, finalize_citations, render_item
 from .state import AgentState
 from .subagent import run_subagent
-from .utils import extract_json, truncate
+from .utils import extract_json, truncate, write_json_atomic
 
 SOURCE_KINDS = ("academic", "web", "datasets", "code", "community")
 _TAG = re.compile(r"S\d+")
@@ -41,18 +52,82 @@ def _slug(text: str, n: int = 50) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (text or "report").lower()).strip("-")[:n] or "report"
 
 
+def _as_bool(value, default: bool) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    return default if value is None else bool(value)
+
+
+def _fit(build, levels: list[tuple], budget: int | None, what: str) -> str:
+    """Build a prompt at the richest evidence level that fits `budget` characters.
+
+    Small local models get a fixed context window, and an over-long prompt is trimmed
+    silently by the server. Trimming our own evidence first keeps the instructions intact.
+    """
+    prompt = ""
+    for i, level in enumerate(levels):
+        prompt = build(*level)
+        if budget is None or len(prompt) <= budget:
+            if i:
+                emit(f"[dim]· trimmed {what} to fit the {settings.ollama_num_ctx}-token context window[/]")
+            return prompt
+    emit(f"[yellow]  ! {what} is still longer than the context window after trimming — the model may miss some of it[/]")
+    return prompt
+
+
+# --------------------------------------------------------------------------- conversation memory
+
+
+def build_prior(state: dict) -> dict:
+    """Turn a finished run into the context a follow-up question needs: the request, the
+    report body with its [n] citations mapped back to [S#] ids, and the cited sources."""
+    report = state.get("report") or ""
+    if not report.strip():
+        return {}
+    sids = state.get("cited_sids") or []
+    sources = state.get("sources") or {}
+    body = report.split("\n## Sources\n", 1)[0]
+    body = re.sub(r"\s*_\(saved to [^)]*\)_\s*$", "", body)
+
+    def back(m: re.Match) -> str:
+        n = int(m.group(1))
+        return f"[{sids[n - 1]}]" if 1 <= n <= len(sids) else m.group(0)
+
+    return {
+        "query": state.get("query", ""),
+        "brief": state.get("brief", ""),
+        "findings": re.sub(r"\[(\d+)\]", back, body).strip(),
+        "sources": {s: sources[s] for s in sids if s in sources},
+    }
+
+
+def _prior_block(state: AgentState, template: str, deepseek_chars: int, ollama_chars: int) -> str:
+    prior = state.get("prior") or {}
+    if not prior.get("findings") or not state.get("follow_up", True):
+        return ""
+    n = deepseek_chars if state.get("backend") == "deepseek" else ollama_chars
+    return template.format(query=prior.get("query", ""), findings=truncate(prior["findings"], n))
+
+
 # --------------------------------------------------------------------------- clarify
 
 
 def clarify_node(state: AgentState) -> dict:
-    """Classify intent, draft a PROVISIONAL brief, and (only if vague) propose clarifying questions."""
+    """Classify intent, draft a PROVISIONAL brief, decide whether this follows up on the
+    previous run, and (only if vague) propose clarifying questions."""
     query = state.get("query") or ""
+    prior = state.get("prior") or {}
     llm = get_llm(state.get("backend"), temperature=0.2, role="lead", max_tokens=2048, thinking=False)
     try:
-        data = extract_json(llm.invoke(CLARIFY_PROMPT.format(query=query, date=_today())).content)
+        data = extract_json(llm.invoke(CLARIFY_PROMPT.format(
+            query=query, date=_today(), prior=_prior_block(state, PRIOR_FOR_CLARIFY, 1500, 700))).content)
     except Exception as exc:
         emit(f"[yellow]  ! clarify failed ({truncate(str(exc), 100)}) — using your request as the brief[/]")
         data = {}
+    follow_up = bool(prior.get("findings")) and _as_bool(data.get("follow_up"), False)
+    if follow_up:
+        emit(f"[dim]· following up on: {truncate(prior.get('query', ''), 70)} "
+             f"({len(prior.get('sources') or {})} sources carried over)[/]")
 
     questions: list[dict] = []
     for q in (data.get("questions") or [])[:3]:
@@ -73,12 +148,17 @@ def clarify_node(state: AgentState) -> dict:
         "clarify_answers": "",
         "plan": [],
         "subagent_reports": [],
-        "sources": {},
+        # A follow-up starts from the previous run's cited sources (same ids), so the new
+        # report can cite them and subagents that re-find them get the existing id.
+        "sources": dict(prior.get("sources") or {}) if follow_up else {},
+        "follow_up": follow_up,
+        "prior": prior if follow_up else {},
         "followups": [],
         "gaps": [],
         "followup_done": False,
         "papers": [],
         "report": "",
+        "cited_sids": [],
     }
 
 
@@ -154,6 +234,7 @@ def plan_node(state: AgentState) -> dict:
     try:
         data = extract_json(llm.invoke(PLAN_PROMPT.format(
             query=state.get("query", ""), brief=state.get("brief", ""),
+            prior=_prior_block(state, PRIOR_FOR_PLAN, 2500, 900),
             max_subagents=ceiling, date=_today())).content)
     except Exception as exc:
         emit(f"[yellow]  ! planning failed ({truncate(str(exc), 100)}) — using one subagent[/]")
@@ -164,8 +245,26 @@ def plan_node(state: AgentState) -> dict:
         plan = [normalize_spec({"objective": state.get("brief") or state.get("query", ""),
                                 "sub_query": state.get("current_query") or state.get("query", ""),
                                 "sources": ["academic", "web"]}, backend)]
+    if settings.single_agent and len(plan) > 1:
+        plan = [merge_specs(plan, state.get("brief") or state.get("query", ""))]
     qtype = data.get("query_type") if data.get("query_type") in {"straightforward", "depth_first", "breadth_first"} else ""
     return {"plan": plan, "query_type": qtype, "max_subagents": ceiling, "replan": False}
+
+
+def merge_specs(plan: list[dict], brief: str) -> dict:
+    """Eval ablation: one subagent that owns the whole plan — every key question and source
+    kind, with the largest budget allowed — so "several subagents vs one" is a fair test."""
+    kq = list(dict.fromkeys(q for s in plan for q in s["key_questions"]))
+    return {
+        "objective": brief,
+        "key_questions": kq[:8],
+        "sub_query": plan[0]["sub_query"],
+        "sources": list(dict.fromkeys(k for s in plan for k in s["sources"])),
+        "tool_budget": settings.subagent_hard_cap,
+        "output_format": "a complete report that answers every key question with [S#] citations",
+        "boundaries": "",
+        "tools": "",
+    }
 
 
 def confirm_node(state: AgentState) -> dict:
@@ -192,24 +291,90 @@ def after_confirm(state: AgentState) -> str:
 # --------------------------------------------------------------------------- research
 
 
+def _wave_path(state: AgentState, start_idx: int):
+    run_id = state.get("run_id")
+    return RUNS_DIR / run_id / f"wave_{start_idx}.json" if run_id else None
+
+
+def _load_wave(path, specs: list[dict]) -> dict | None:
+    """Progress saved by an interrupted run of this same wave, or None."""
+    if not path or not path.exists():
+        return None
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if saved.get("objectives") != [s.get("objective") for s in specs]:
+        return None  # a different plan: start over
+    return saved
+
+
+def _failed_report(spec: dict, exc: Exception) -> dict:
+    return {"objective": spec.get("objective", ""), "findings": f"(this subagent failed: {truncate(str(exc), 200)})",
+            "sources": [], "tools": [], "tool_calls": 0, "turns": 0}
+
+
 def dispatch(specs: list[dict], state: AgentState, start_idx: int = 1) -> tuple[list[dict], dict]:
-    """Run subagents (parallel on DeepSeek, sequential on one local GPU)."""
+    """Run subagents (parallel on DeepSeek, sequential on one local GPU).
+
+    Each finished subagent is saved to runs/<id>/wave_<n>.json together with the source
+    registry, so if the process dies mid-wave, re-running this node (/resume) reuses the
+    finished subagents — same results, same source ids — and only runs the rest.
+    """
     backend = state.get("backend")
-    registry = SourceRegistry(state.get("sources") or {})
+    path = _wave_path(state, start_idx)
+    saved = _load_wave(path, specs)
+    registry = SourceRegistry(saved["registry"] if saved else (state.get("sources") or {}))
+    done: dict[int, dict] = {int(k): v for k, v in ((saved or {}).get("done") or {}).items()}
     total = start_idx - 1 + len(specs)
-    parallel = backend == "deepseek" and settings.parallel_subagents and len(specs) > 1
-    emit(f"[dim]· dispatching {len(specs)} subagent(s) [{'parallel' if parallel else 'sequential'}][/]")
+    pending = [(i, s) for i, s in enumerate(specs, start_idx) if i not in done]
+    parallel = backend == "deepseek" and settings.parallel_subagents and len(pending) > 1
+    if done:
+        emit(f"[dim]· reusing {len(done)} subagent(s) finished before the interruption[/]")
+    if pending:
+        emit(f"[dim]· dispatching {len(pending)} subagent(s) ({'parallel' if parallel else 'sequential'})[/]")
+    limit = settings.wave_time_limit_min
+    deadline = time.monotonic() + limit * 60 if limit and limit > 0 else None
+    lock = threading.Lock()
+    failed: dict[int, dict] = {}
+
+    def save() -> None:
+        if not path:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(path, {"objectives": [s.get("objective") for s in specs],
+                                     "registry": registry.to_dict(), "done": {str(k): v for k, v in done.items()}},
+                              indent=None)
+        except Exception:
+            pass  # progress saving is best-effort; the run itself must not fail on it
 
     def go(item):
         i, spec = item
-        return run_subagent(spec, backend, registry, i, total, state.get("brief", ""), state.get("run_id", ""))
+        try:
+            result = run_subagent(spec, backend, registry, i, total, state.get("brief", ""),
+                                  state.get("run_id", ""), deadline)
+        except Exception as exc:  # one broken subagent must not sink its siblings
+            emit(f"[yellow]  ! subagent [{i}/{total}] failed: {truncate(str(exc), 120)}[/]")
+            with lock:
+                failed[i] = _failed_report(spec, exc)  # not saved as done, so /resume retries it
+            return
+        with lock:
+            done[i] = result
+            save()
 
-    items = list(enumerate(specs, start_idx))
     if parallel:
-        with ThreadPoolExecutor(max_workers=min(len(specs), 8)) as ex:
-            reports = list(ex.map(go, items))
+        with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as ex:
+            list(ex.map(go, pending))
     else:
-        reports = [go(it) for it in items]
+        for item in pending:
+            go(item)
+    reports = [done.get(i) or failed[i] for i in range(start_idx, start_idx + len(specs))]
+    if path and not failed:
+        try:
+            path.unlink(missing_ok=True)  # the graph checkpoint now holds the results
+        except Exception:
+            pass
     return reports, registry.to_dict()
 
 
@@ -231,20 +396,27 @@ def review_node(state: AgentState) -> dict:
     if state.get("followup_done") or not lead_iteration_enabled(backend) or settings.max_followup_subagents <= 0:
         return {"followups": []}
     llm = get_llm(backend, temperature=0.2, role="lead", max_tokens=6144)
+    reports = state.get("subagent_reports", [])
+    prompt = _fit(
+        lambda limit: REVIEW_PROMPT.format(brief=state.get("brief", ""), briefings=_briefings(reports, limit),
+                                           max_followups=settings.max_followup_subagents),
+        [(1800,), (1200,), (800,), (500,), (300,)], input_char_budget(backend, 1536), "the review prompt")
     try:
-        data = extract_json(llm.invoke(REVIEW_PROMPT.format(
-            brief=state.get("brief", ""), briefings=_briefings(state.get("subagent_reports", []), 1800),
-            max_followups=settings.max_followup_subagents)).content)
+        data = extract_json(llm.invoke(prompt).content)
     except Exception:
         return {"followups": []}
-    if data.get("sufficient", True) and not data.get("followups"):
-        return {"followups": [], "gaps": data.get("gaps") or []}
-    specs = [p for p in (normalize_spec(s, backend) for s in (data.get("followups") or [])) if p]
+    gaps = data.get("gaps") or []
+    raw = data.get("followups") or []
+    # The lead's verdict wins: "sufficient" means no follow-up wave, even if it also listed
+    # some (nice-to-haves). If it gave no verdict, listing follow-ups means it wants them.
+    if _as_bool(data.get("sufficient"), default=not raw) or not raw:
+        return {"followups": [], "gaps": gaps}
+    specs = [p for p in (normalize_spec(s, backend) for s in raw) if p]
     specs = specs[: settings.max_followup_subagents]
     if specs:
         emit(f"[dim]· lead found gaps → {len(specs)} follow-up subagent(s): "
              f"{'; '.join(truncate(s['objective'], 50) for s in specs)}[/]")
-    return {"followups": specs, "gaps": data.get("gaps") or []}
+    return {"followups": specs, "gaps": gaps}
 
 
 def after_review(state: AgentState) -> str:
@@ -261,7 +433,8 @@ def followup_node(state: AgentState) -> dict:
 
 
 def _catalog(state: AgentState, cap: int) -> str:
-    """Sources the subagents actually cited first, then their other finds, up to `cap`."""
+    """Sources the subagents actually cited first, then (on a follow-up) the sources the
+    previous report cited, then the subagents' other finds, up to `cap`."""
     sources = state.get("sources") or {}
     reports = state.get("subagent_reports", [])
     cited = []
@@ -269,19 +442,29 @@ def _catalog(state: AgentState, cap: int) -> str:
         for sid in _TAG.findall(r.get("findings", "")):
             if sid in sources and sid not in cited:
                 cited.append(sid)
+    carried = [s for s in ((state.get("prior") or {}).get("sources") or {}) if s in sources] \
+        if state.get("follow_up") else []
     extra = [s for r in reports for s in r.get("sources", []) if s in sources and s not in cited]
-    ordered = list(dict.fromkeys(cited + extra))[:cap]
+    ordered = list(dict.fromkeys(cited + carried + extra))[:cap]
     return "\n".join(render_item(s, sources[s]["kind"], sources[s]["item"]) for s in ordered) or "(none)"
 
 
 def report_node(state: AgentState) -> dict:
     """LEAD: write the final report from the subagent reports, keeping [S#] tags."""
     backend = state.get("backend")
-    cap = 80 if backend == "deepseek" else 25
-    limit = 3000 if backend == "deepseek" else 1400
-    prompt = REPORT_PROMPT.format(
-        date=_today(), query=state.get("query", ""), brief=state.get("brief", ""),
-        briefings=_briefings(state.get("subagent_reports", []), limit), catalog=_catalog(state, cap))
+    reports = state.get("subagent_reports", [])
+
+    def build(cap: int, limit: int, prior_chars: int) -> str:
+        prior = _prior_block(state, PRIOR_FOR_REPORT, prior_chars, prior_chars)
+        return REPORT_PROMPT.format(
+            date=_today(), query=state.get("query", ""), brief=state.get("brief", ""), prior=prior,
+            briefings=_briefings(reports, limit), catalog=_catalog(state, cap))
+
+    if backend == "deepseek":
+        levels = [(80, 3000, 3000)]
+    else:  # shrink evidence step by step until it fits next to a full-length report
+        levels = [(25, 1400, 1200), (18, 1100, 900), (12, 800, 600), (8, 500, 400), (5, 300, 250)]
+    prompt = _fit(build, levels, input_char_budget(backend, settings.report_max_tokens), "the report evidence")
     report, error = "", ""
     # If thinking consumes the whole output budget the answer comes back empty — retry without it.
     for thinking in (None, False):
@@ -316,14 +499,16 @@ def cite_node(state: AgentState) -> dict:
         run_dir = RUNS_DIR / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "report.md").write_text(final, encoding="utf-8")
-        (run_dir / "sources.json").write_text(json.dumps(sources, indent=1, default=str), encoding="utf-8")
-        (run_dir / "plan.json").write_text(json.dumps({
+        write_json_atomic(run_dir / "sources.json", sources, indent=1)
+        write_json_atomic(run_dir / "plan.json", {
             "query": state.get("query"), "brief": state.get("brief"), "query_type": state.get("query_type"),
+            "follow_up_of": (state.get("prior") or {}).get("query") if state.get("follow_up") else None,
             "plan": state.get("plan"), "gaps": state.get("gaps"), "citation_stats": stats,
             "subagents": [{k: r.get(k) for k in ("objective", "tool_calls", "turns", "tools")}
                           for r in state.get("subagent_reports", [])],
-        }, indent=1, default=str), encoding="utf-8")
+        }, indent=1)
         final += f"\n\n_(saved to {path})_"
     except Exception:
         pass
-    return {"report": final, "papers": papers, "citation_stats": stats, "messages": [AIMessage(content=final)]}
+    return {"report": final, "papers": papers, "citation_stats": stats, "cited_sids": [c["sid"] for c in cited],
+            "messages": [AIMessage(content=final)]}

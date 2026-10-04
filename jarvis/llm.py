@@ -10,6 +10,8 @@ exactly how many tokens it burned and what that cost.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 from typing import Any
 
@@ -39,6 +41,88 @@ def resolve_backend(requested: str | None = None) -> tuple[str, str | None]:
     return backend, None
 
 
+def model_label(backend: str) -> str:
+    """The model name to show for a backend (the lead model on DeepSeek)."""
+    return settings.deepseek_lead_model if backend == "deepseek" else settings.ollama_model
+
+
+# --------------------------------------------------------------------------- health check
+
+
+def _ollama_has(names: set[str], model: str) -> bool:
+    return model in names or (":" not in model and f"{model}:latest" in names)
+
+
+def check_ollama(models: list[str]) -> str | None:
+    """None if Ollama is up and has every model in `models`, else a message saying how to fix it."""
+    import requests
+
+    base = settings.ollama_base_url.rstrip("/")
+    try:
+        r = requests.get(f"{base}/api/tags", timeout=5)
+        r.raise_for_status()
+        names = {m.get("name", "") for m in r.json().get("models", [])}
+    except Exception:
+        return (f"Ollama isn't running at {base}. Start it (open the Ollama app or run `ollama serve`), "
+                "or /backend deepseek.")
+    missing = [m for m in models if not _ollama_has(names, m)]
+    if missing:
+        return ("Ollama is running but these models aren't pulled: " + ", ".join(missing)
+                + ". Run: " + " && ".join(f"ollama pull {m}" for m in missing))
+    return None
+
+
+def check_embeddings() -> str | None:
+    """/read indexing and /ask always embed locally, even on DeepSeek."""
+    return check_ollama([settings.embed_model])
+
+
+def check_backend(backend: str) -> str | None:
+    """Fail fast before a run: return a clear error message, or None if the backend is usable.
+
+    Without this, a stopped Ollama makes every step fall back to its default and the
+    run "finishes" with an almost empty report.
+    """
+    import requests
+
+    if backend == "deepseek":
+        try:
+            r = requests.get(f"{settings.deepseek_base_url.rstrip('/')}/models", timeout=10,
+                             headers={"Authorization": f"Bearer {settings.deepseek_api_key}"})
+        except requests.RequestException as exc:
+            return (f"Can't reach DeepSeek at {settings.deepseek_base_url} ({type(exc).__name__}). "
+                    "Check your internet connection.")
+        if r.status_code in (401, 403):
+            return f"DeepSeek rejected the API key (HTTP {r.status_code}). Check DEEPSEEK_API_KEY in .env."
+        if r.status_code >= 500:
+            return f"DeepSeek is having problems (HTTP {r.status_code}). Try again shortly, or /backend ollama."
+        return None
+    return check_ollama([settings.ollama_model] + ([settings.ollama_lead_model] if settings.ollama_lead_model else []))
+
+
+# --------------------------------------------------------------------------- context budget
+
+CHARS_PER_TOKEN = 3.2  # conservative for English + URLs; real tokenizers average closer to 4
+
+
+def estimate_tokens(text: str) -> int:
+    return int(len(text or "") / CHARS_PER_TOKEN) + 1
+
+
+def input_char_budget(backend: str | None, max_tokens: int | None = None) -> int | None:
+    """How many prompt characters fit, or None when the window is effectively unlimited.
+
+    Ollama's num_ctx covers prompt AND output, and when the prompt is too long Ollama
+    trims it silently, which can drop instructions or evidence. So callers shrink their
+    own input to this budget instead. DeepSeek's window is far larger than anything
+    Jarvis sends.
+    """
+    if (backend or active_backend()) == "deepseek":
+        return None
+    out = max_tokens or settings.ollama_num_predict
+    return max(1000, int((settings.ollama_num_ctx - out - 256) * CHARS_PER_TOKEN))
+
+
 # --------------------------------------------------------------------------- usage
 
 
@@ -47,6 +131,8 @@ class UsageTracker(BaseCallbackHandler):
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._path = None
+        self._key = ""
         self.reset()
 
     def reset(self) -> None:
@@ -54,6 +140,39 @@ class UsageTracker(BaseCallbackHandler):
             self.data = {
                 r: {"calls": 0, "in": 0, "cached": 0, "out": 0} for r in ("lead", "worker")
             }
+            self._path = None
+            self._key = ""
+
+    def attach(self, path, key: str) -> None:
+        """Save the counts to `path` after every LLM call, tagged with `key` (the run's
+        thread id), so a crashed run's spend can be restored by /resume."""
+        with self._lock:
+            self._path, self._key = path, key
+            self._save()
+
+    def restore(self, path, key: str) -> bool:
+        """Load counts saved by `attach` for the same key. True if anything was restored."""
+        try:
+            saved = json.loads(open(path, encoding="utf-8").read())
+        except Exception:
+            return False
+        if saved.get("key") != key:
+            return False
+        with self._lock:
+            for role, d in (saved.get("usage") or {}).items():
+                self.data[role] = {k: int(d.get(k, 0)) for k in ("calls", "in", "cached", "out")}
+        return True
+
+    def _save(self) -> None:  # caller holds the lock
+        if not self._path:
+            return
+        try:
+            tmp = f"{self._path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"key": self._key, "usage": self.data}, f)
+            os.replace(tmp, self._path)
+        except Exception:
+            pass
 
     def record(self, role: str, usage: dict) -> None:
         details = usage.get("input_token_details") or {}
@@ -63,6 +182,7 @@ class UsageTracker(BaseCallbackHandler):
             d["in"] += int(usage.get("input_tokens") or 0)
             d["cached"] += int(details.get("cache_read") or 0)
             d["out"] += int(usage.get("output_tokens") or 0)
+            self._save()
 
     def snapshot(self) -> dict:
         with self._lock:

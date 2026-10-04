@@ -13,6 +13,10 @@ from langchain_core.messages import AIMessage
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from jarvis import config  # noqa: E402
+from jarvis import llm as _llm  # noqa: E402
+
+REAL_CHECK_BACKEND = _llm.check_backend  # the autouse fixture below replaces it in every test
+REAL_CHECK_OLLAMA = _llm.check_ollama
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +36,9 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(subagent, "RUNS_DIR", tmp_path / "runs_dir")
     monkeypatch.setattr(config.settings, "tool_cache_hours", 0)
     monkeypatch.setattr(config.settings, "deepseek_api_key", "")
+    import jarvis.llm as llm
+
+    monkeypatch.setattr(llm, "check_backend", lambda *a, **k: None)  # no real Ollama/DeepSeek in tests
     yield
 
 

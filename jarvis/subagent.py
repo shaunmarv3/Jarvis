@@ -11,8 +11,11 @@ subagents; the previous version never showed the model its own results.
 from __future__ import annotations
 
 import inspect
+import json
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import date
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -20,7 +23,7 @@ from langchain_core.tools import tool
 
 from .config import RUNS_DIR, default_budget, settings
 from .events import emit
-from .llm import get_llm
+from .llm import get_llm, input_char_budget
 from .prompts import SUBAGENT_FINISH, SUBAGENT_SYSTEM, SUBAGENT_TASK
 from .sources import RESULT_KINDS, SourceRegistry, render_item
 from .tools import TOOL_FUNCS, TOOL_SCHEMAS
@@ -115,18 +118,72 @@ def _fmt_call(name: str, args: dict) -> str:
     return f"{name}({', '.join(f'{k}={truncate(str(v), 40)}' for k, v in (args or {}).items())})"
 
 
+def _size(msgs: list) -> int:
+    return sum(len(str(m.content)) for m in msgs)
+
+
+def _trim(m: ToolMessage, n: int, note: str) -> ToolMessage:
+    text = str(m.content)
+    return m if len(text) <= n else ToolMessage(content=text[:n] + f" …[{note}]", tool_call_id=m.tool_call_id)
+
+
 def _compact(msgs: list, limit_chars: int) -> list:
-    """Keep the conversation inside a small context window: shrink older tool results
-    (the latest round stays intact) once the transcript gets too long."""
-    total = sum(len(str(m.content)) for m in msgs)
-    if total <= limit_chars:
+    """Fit the conversation into `limit_chars`, trimming deliberately instead of letting a
+    small local model's server cut the prompt (which can drop the instructions).
+
+    Stage 1 shrinks tool results older than the latest model turn to 700 chars; stage 2 to
+    150 chars; stage 3 shares what is left among the latest round's results. The system
+    prompt, the task and the model's own messages are never cut.
+    """
+    if _size(msgs) <= limit_chars:
         return msgs
-    last_ai = max(i for i, m in enumerate(msgs) if m.type == "ai") if any(m.type == "ai" for m in msgs) else len(msgs)
-    out = []
-    for i, m in enumerate(msgs):
-        if isinstance(m, ToolMessage) and i < last_ai and len(str(m.content)) > 700:
-            m = ToolMessage(content=str(m.content)[:700] + " …[older result trimmed]", tool_call_id=m.tool_call_id)
-        out.append(m)
+    ai_idx = [i for i, m in enumerate(msgs) if m.type == "ai"]
+    last_ai = ai_idx[-1] if ai_idx else len(msgs)
+    out = list(msgs)
+    for keep in (700, 150):
+        out = [_trim(m, keep, "older result trimmed") if isinstance(m, ToolMessage) and i < last_ai else m
+               for i, m in enumerate(out)]
+        if _size(out) <= limit_chars:
+            return out
+    latest = [i for i, m in enumerate(out) if isinstance(m, ToolMessage) and i > last_ai]
+    if latest:
+        fixed = _size([m for i, m in enumerate(out) if i not in latest])
+        share = max(200, (limit_chars - fixed) // len(latest))
+        out = [_trim(m, share, "trimmed to fit the context window") if i in latest else m
+               for i, m in enumerate(out)]
+    return out
+
+
+def _tools_overhead(tools: list) -> int:
+    """Characters the bound tool schemas add to every request (they share the context window)."""
+    try:
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+
+        return len(json.dumps([convert_to_openai_tool(t) for t in tools]))
+    except Exception:
+        return 6000
+
+
+def _run_parallel(calls: list, registry: SourceRegistry, deadline: float | None = None) -> dict:
+    """Run one turn's tool calls concurrently. A call still running after the timeout is
+    abandoned (its thread finishes on its own) and answered with an error the model can
+    act on, so one hung API can't stall the subagent."""
+    limit = float(settings.tool_timeout)
+    if deadline:
+        limit = max(5.0, min(limit, deadline - time.monotonic()))
+    ex = ThreadPoolExecutor(max_workers=min(4, len(calls)))
+    futs = {c["id"]: ex.submit(execute_tool, c["name"], c.get("args") or {}, registry) for c in calls}
+    end = time.monotonic() + limit
+    out = {}
+    for c in calls:
+        try:
+            out[c["id"]] = futs[c["id"]].result(timeout=max(0.0, end - time.monotonic()))
+        except FuturesTimeout:
+            out[c["id"]] = (f"Tool {c['name']} timed out after {limit:.0f}s and was abandoned. "
+                            "Try another source or different arguments.", [])
+        except Exception as exc:  # execute_tool already guards tools; this is a last line
+            out[c["id"]] = (f"Tool {c['name']} failed: {exc}.", [])
+    ex.shutdown(wait=False, cancel_futures=True)
     return out
 
 
@@ -146,15 +203,22 @@ def run_subagent(
     total: int = 1,
     brief: str = "",
     run_id: str = "",
+    deadline: float | None = None,
 ) -> dict:
-    """Research one delegated task end-to-end. Returns a structured report dict."""
+    """Research one delegated task end-to-end. Returns a structured report dict.
+
+    `deadline` (a time.monotonic() value) is the wave's time limit: once it passes, the
+    subagent stops researching and writes its report from what it already has.
+    """
     objective = (spec.get("objective") or "").strip()
     budget = _clamp_budget(spec, backend)
     sources = [s for s in (spec.get("sources") or ["academic", "web"]) if s in _FALLBACK] or ["academic", "web"]
     tag = f"[{idx}/{total}]"
-    ctx_limit = settings.ollama_num_ctx * 2 if backend != "deepseek" else 400_000
+    tools = TOOL_SCHEMAS + [complete_task]
+    window = input_char_budget(backend)  # None on DeepSeek (window far larger than 8 turns)
+    ctx_limit = 400_000 if window is None else max(4000, window - _tools_overhead(tools))
 
-    llm = get_llm(backend, temperature=0.2, role="worker").bind_tools(TOOL_SCHEMAS + [complete_task])
+    llm = get_llm(backend, temperature=0.2, role="worker").bind_tools(tools)
     msgs: list = [
         SystemMessage(SUBAGENT_SYSTEM.format(date=date.today().isoformat(), budget=budget,
                                              max_reads=settings.subagent_max_reads)),
@@ -178,6 +242,9 @@ def run_subagent(
     emit(f"[dim]  → subagent {tag} [cyan]{truncate(objective, 70)}[/] · budget {budget}[/]")
 
     for turn in range(settings.subagent_max_turns):
+        if deadline and time.monotonic() >= deadline:
+            emit(f"[yellow]  ! subagent {tag} hit the wave time limit — writing its report now[/]")
+            break
         turns = turn + 1
         try:
             ai = llm.invoke(_compact(msgs, ctx_limit))
@@ -199,8 +266,9 @@ def run_subagent(
                         called.append(_fmt_call(name, {"query": q}))
                         texts.append(text)
                 emit(f"[dim]    {tag} (model skipped tools — ran starter searches)[/]")
+                share = max(800, ctx_limit // (3 * max(1, len(texts))))  # compaction never trims this message
                 msgs.append(HumanMessage("Do not answer from memory. Starting search results:\n\n"
-                                         + "\n\n".join(texts)
+                                         + "\n\n".join(truncate(t, share) for t in texts)
                                          + "\n\nContinue researching with tools, then call complete_task."))
                 continue
             report = (ai.content or "").strip() or None
@@ -213,16 +281,11 @@ def run_subagent(
         reads_ok = [c for c in work if c["name"] in _READ_TOOLS][: max(0, max_reads - reads)]
         allowed = [c for c in work if c in searches_ok or c in reads_ok]
 
-        def run(c):
-            return execute_tool(c["name"], c.get("args") or {}, registry)
-
         results = {}
         if allowed:
             for c in allowed:
                 emit(f"[dim]    {tag} {_fmt_call(c['name'], c.get('args'))}[/]")
-            with ThreadPoolExecutor(max_workers=min(4, len(allowed))) as ex:
-                for c, res in zip(allowed, ex.map(run, allowed)):
-                    results[c["id"]] = res
+            results = _run_parallel(allowed, registry, deadline)
         used += len(searches_ok)
         reads += len(reads_ok)
 
@@ -240,10 +303,7 @@ def run_subagent(
                         else "Skipped: search budget exhausted — read key sources or call complete_task.")
             msgs.append(ToolMessage(content=text, tool_call_id=c["id"]))
 
-        if finish and not work:
-            report = str((finish.get("args") or {}).get("report") or "").strip() or None
-            break
-        if finish:  # finished while also calling tools: accept the report
+        if finish:  # tools called in the same turn have already run; accept the report
             report = str((finish.get("args") or {}).get("report") or "").strip() or None
             break
         if used >= budget and reads >= max_reads:
@@ -258,9 +318,7 @@ def run_subagent(
 
     if not report:
         try:
-            closer = get_llm(backend, temperature=0.2, role="worker").bind_tools(
-                TOOL_SCHEMAS + [complete_task], tool_choice="none"
-            )
+            closer = get_llm(backend, temperature=0.2, role="worker").bind_tools(tools, tool_choice="none")
             ai = closer.invoke(_compact(msgs + [HumanMessage(SUBAGENT_FINISH)], ctx_limit))
             report = (ai.content or "").strip()
             if not report and getattr(ai, "tool_calls", None):

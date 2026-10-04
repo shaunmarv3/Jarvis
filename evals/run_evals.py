@@ -1,13 +1,18 @@
-"""Headless eval runner: research each benchmark query end-to-end, then judge it.
+"""Headless eval runner: research each benchmark query end-to-end, then grade the report.
 
-  python evals/run_evals.py --backend deepseek --limit 4
-  python evals/run_evals.py --ids rag-eval,lora-qlora
-  python evals/run_evals.py --jarvis-path ../jarvis-main --label baseline   # judge another checkout
-  python evals/run_evals.py --rejudge evals/results/x.json --label x-rejudged # re-grade saved reports
+  python evals/run_evals.py --limit 4                          # quick check
+  python evals/run_evals.py --repeats 3 --workers 3            # full benchmark, mean ± spread
+  python evals/run_evals.py --ablation single_agent            # switch one design piece off
+  python evals/run_evals.py --system baseline                  # 1 web + 1 arXiv search + 1 LLM call
+  python evals/run_evals.py --judge anthropic                  # cross-family judge (no self-preference)
+  python evals/run_evals.py --jarvis-path ../old --label prev  # grade another checkout
+  python evals/run_evals.py --rejudge results/x.json --judge anthropic --label x-claude
+  python evals/run_evals.py --table results/a.json results/b.json   # one comparison table
 
+Grading = one LLM-judge call on Anthropic's 5-criterion rubric + checks done in code
+(fact recall on known-answer queries, truncation, dangling citations, cost, time).
 The driver only relies on the graph's interrupt protocol (clarify_questions /
-confirm_plan), so it can run older versions of Jarvis too — that's how the README's
-before/after table is produced. The judge is always the same model (DeepSeek lead).
+confirm_plan), so it can also run older versions of Jarvis.
 """
 
 from __future__ import annotations
@@ -16,30 +21,29 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
+RESULTS = HERE / "results"
+
+# Each ablation switches off ONE piece of the design, so its effect can be measured.
+ABLATIONS = {
+    "none": {},
+    "no_followup": {"lead_iteration": False},  # no gap-filling follow-up wave
+    "no_reads": {"subagent_max_reads": 0},  # abstracts/snippets only, no full-text reads
+    "single_agent": {"single_agent": True},  # one subagent gets the whole plan
+}
 
 
-def _judge_llm():
-    from dotenv import load_dotenv
-    from langchain_deepseek import ChatDeepSeek
-
-    load_dotenv(REPO / ".env")
-    key = os.environ.get("DEEPSEEK_API_KEY", "")
-    if not key:
-        sys.exit("DEEPSEEK_API_KEY missing in .env — the judge needs it.")
-    return ChatDeepSeek(
-        model=os.environ.get("DEEPSEEK_LEAD_MODEL", "deepseek-v4-pro"), api_key=key,
-        api_base=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        max_tokens=24000, extra_body={"thinking": {"type": "enabled"}}, reasoning_effort="low",
-        timeout=300, max_retries=3,
-    )
+# --------------------------------------------------------------------------- running
 
 
 def _drive(graph, query: str, backend: str) -> dict:
@@ -68,9 +72,7 @@ def _evidence(state: dict, report: str) -> str:
     """Render each listed source with its abstract/snippet so the judge can check claims."""
     from judge import split_sources
 
-    items = []
-    for e in (state.get("sources") or {}).values():
-        items.append(e["item"])
+    items = [e["item"] for e in (state.get("sources") or {}).values()]
     for key in ("papers", "web", "datasets"):
         items.extend(state.get(key) or [])
     by_url = {}
@@ -88,61 +90,259 @@ def _evidence(state: dict, report: str) -> str:
     return "\n".join(lines) or "(the report lists no sources)"
 
 
-def _process(state: dict, seconds: float) -> str:
+def _process(state: dict, seconds: float, system: str = "jarvis") -> str:
     reps = state.get("subagent_reports") or []
     calls = sum(r.get("tool_calls") or len(r.get("tools") or []) for r in reps)
+    if system == "baseline":
+        return f"single LLM call over {calls} searches, {seconds:.0f}s wall time"
     return f"{len(reps)} subagents, {calls} tool calls, {seconds:.0f}s wall time"
 
 
-def _write_summary(results: list[dict], label: str, criteria: list[str]) -> str:
-    out_dir = HERE / "results"
-    out_dir.mkdir(exist_ok=True)
-    stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
-    (out_dir / f"{label}-{stamp}.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
-    n = len(results) or 1
-    avg = {c: sum(r[c] for r in results) / n for c in criteria + ["overall"]}
-    costs = [r["cost_usd"] for r in results if r.get("cost_usd") is not None]
-    row = (
-        f"| {label} | " + " | ".join(f"{avg[c]:.2f}" for c in criteria + ["overall"])
-        + f" | {sum(r['pass'] for r in results)}/{len(results)}"
-        + f" | {sum(r['looks_truncated'] for r in results)}"
-        + f" | {sum(r['dangling_citations'] for r in results)}"
-        + f" | {sum(r['citations_in_text'] for r in results) / n:.0f}"
-        + f" | {sum(r['seconds'] for r in results) / n:.0f}s"
-        + (f" | ${sum(costs) / len(costs):.3f} |" if costs else " | n/a |")
-    )
-    header = (
-        "| version | " + " | ".join(criteria + ["overall"])
-        + " | pass | truncated | dangling cites | avg citations | avg time | avg cost |\n"
-        + "|---" * (len(criteria) + 9) + "|"
-    )
-    summary = header + "\n" + row
-    (out_dir / f"{label}-{stamp}.md").write_text(summary + "\n", encoding="utf-8")
-    return summary
+def _setup(args):
+    """Import the Jarvis checkout under test and apply the ablation. Returns jarvis.llm."""
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO / ".env")
+    sys.path.insert(0, str(Path(args.jarvis_path).resolve()))
+    import jarvis.config as jconfig
+    import jarvis.llm as jllm
+
+    for key, value in ABLATIONS[args.ablation].items():
+        if key not in type(jconfig.settings).model_fields:
+            sys.exit(f"This Jarvis checkout has no '{key}' setting, so it can't run the '{args.ablation}' ablation.")
+        setattr(jconfig.settings, key, value)
+    if hasattr(jllm, "set_active_backend"):
+        jllm.set_active_backend(args.backend)
+    return jllm
 
 
-def _rejudge(path: str, label: str) -> int:
-    """Re-grade saved results with the current judge (evidence rebuilt from data/runs artifacts)."""
-    from judge import CRITERIA, deterministic_metrics, judge
+def run_job(q: dict, repeat: int, args, judge_llm) -> dict:
+    """Research one query once and grade it."""
+    import jarvis.llm as jllm
+    from judge import CRITERIA, deterministic_metrics, fact_recall, judge
+
+    tracker = getattr(jllm, "usage", None)
+    if tracker:
+        tracker.reset()
+    t0 = time.time()
+    try:
+        if args.system == "baseline":
+            from baseline import run_baseline
+
+            state = run_baseline(q["query"], args.backend)
+        else:
+            from langgraph.checkpoint.memory import MemorySaver
+
+            import jarvis.graph as jgraph
+
+            state = _drive(jgraph.build_graph(MemorySaver()), q["query"], args.backend)
+        error = ""
+    except Exception as exc:
+        state, error = {}, f"{type(exc).__name__}: {exc}"
+    secs = time.time() - t0
+    report = state.get("report") or ""
+    cost = tracker.cost(args.backend) if tracker else None
+    recall, missing = fact_recall(report, q.get("facts"))
+    evidence = _evidence(state, report)
+    process = _process(state, secs, args.system)
+    judge_error = ""
+    if report:
+        try:
+            scores = judge(judge_llm, q["query"], report, evidence, process)
+        except Exception as exc:
+            judge_error = f"{type(exc).__name__}: {exc}"
+            scores = {**{c: 0.0 for c in CRITERIA}, "overall": 0.0, "pass": False, "notes": "judge failed"}
+    else:
+        scores = {**{c: 0.0 for c in CRITERIA}, "overall": 0.0, "pass": False, "notes": error or "no report"}
+    return {
+        "id": q["id"], "type": q.get("type", ""), "query": q["query"], "repeat": repeat,
+        "label": args.label, "system": args.system, "ablation": args.ablation,
+        "judge": f"{args.judge}:{getattr(judge_llm, 'model', getattr(judge_llm, 'model_name', ''))}",
+        "seconds": round(secs, 1), "cost_usd": cost, "error": error, "judge_error": judge_error,
+        "process": process, **deterministic_metrics(report),
+        "fact_recall": recall, "facts_missing": missing, **scores,
+        "report": report, "evidence": evidence,
+    }
+
+
+def _print_row(row: dict) -> None:
+    fr = "" if row["fact_recall"] is None else f" · facts {row['fact_recall']:.2f}"
+    cost = f"${row['cost_usd']:.3f}" if row.get("cost_usd") is not None else "n/a"
+    print(f"  [{row['id']} r{row['repeat']}] overall {row['overall']:.2f}{fr} pass={row['pass']} · "
+          f"{row['process']} · {cost} · truncated={row['looks_truncated']}", flush=True)
+    if row.get("error") or row.get("judge_error"):
+        print(f"    ! {row.get('error') or row.get('judge_error')}", flush=True)
+
+
+# --------------------------------------------------------------------------- parallel workers
+
+
+def _child_cmd(args, job: str, out: Path) -> list[str]:
+    cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--job", job, "--out", str(out),
+           "--backend", args.backend, "--system", args.system, "--ablation", args.ablation,
+           "--judge", args.judge, "--jarvis-path", args.jarvis_path, "--label", args.label]
+    if args.judge_model:
+        cmd += ["--judge-model", args.judge_model]
+    return cmd
+
+
+def _run_parallel(jobs: list[tuple[dict, int]], args, stamp: str) -> list[dict]:
+    """One subprocess per (query, repeat): every run gets its own token tracker and process
+    state, so concurrent runs can't mix their costs."""
+    logs = RESULTS / "logs" / f"{args.label}-{stamp}"
+    logs.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "PYTHONUTF8": "1"}
+
+    def go(job):
+        q, r = job
+        out = logs / f"{q['id']}-r{r}.json"
+        with open(logs / f"{q['id']}-r{r}.log", "w", encoding="utf-8") as log:
+            subprocess.run(_child_cmd(args, f"{q['id']}:{r}", out), stdout=log, stderr=subprocess.STDOUT,
+                           env=env, cwd=str(REPO))
+        try:
+            row = json.loads(out.read_text(encoding="utf-8"))
+        except Exception:
+            row = {"id": q["id"], "type": q.get("type", ""), "query": q["query"], "repeat": r, "label": args.label,
+                   "error": f"worker crashed — see {logs / (q['id'] + f'-r{r}.log')}", "judge_error": "",
+                   "overall": 0.0, "pass": False, "fact_recall": None, "looks_truncated": False,
+                   "citations_in_text": 0, "dangling_citations": 0, "seconds": 0, "cost_usd": None,
+                   "process": "crashed", **{c: 0.0 for c in _criteria()}}
+        _print_row(row)
+        return row
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        return list(ex.map(go, jobs))
+
+
+def _criteria() -> list[str]:
+    from judge import CRITERIA
+
+    return CRITERIA
+
+
+# --------------------------------------------------------------------------- summaries
+
+
+def _fmt(values: list[float], pct: bool = False) -> str:
+    from judge import mean, sd
+
+    if not values:
+        return "—"
+    m = mean(values)
+    s = f"{m * 100:.0f}%" if pct else f"{m:.2f}"
+    if len(values) > 1:
+        s += f" ± {sd(values) * 100:.0f}" if pct else f" ± {sd(values):.2f}"
+    return s
+
+
+def summary_row(rows: list[dict], label: str | None = None) -> str:
+    """One table row: each score is the mean over repeats of the per-repeat average, ± the
+    standard deviation across repeats (shown when there is more than one repeat)."""
+    from judge import mean
+
+    crit = _criteria()
+    graded = [r for r in rows if not r.get("judge_error")]
+    by_rep = defaultdict(list)
+    for r in graded:
+        by_rep[r.get("repeat", 0)].append(r)
+
+    def per_rep(fn):
+        vals = [fn(rs) for rs in by_rep.values()]
+        return [v for v in vals if v == v]  # drop NaN
+
+    cells = [_fmt(per_rep(lambda rs, c=c: mean([r[c] for r in rs]))) for c in crit + ["overall"]]
+    cells.append(_fmt(per_rep(lambda rs: mean([r["fact_recall"] for r in rs if r.get("fact_recall") is not None]))))
+    cells.append(_fmt(per_rep(lambda rs: mean([1.0 if r["pass"] else 0.0 for r in rs])), pct=True))
+    costs = [r["cost_usd"] for r in rows if r.get("cost_usd") is not None]
+    label = label or (rows[0].get("label") if rows else None) or "?"
+    n_q = len({r["id"] for r in rows})
+    return (f"| {label} | {n_q}×{len(by_rep) or 1} | " + " | ".join(cells)
+            + f" | {sum(bool(r.get('looks_truncated')) for r in rows)}"
+            + f" | {mean([r.get('citations_in_text', 0) for r in rows]):.0f}"
+            + f" | {mean([r.get('seconds', 0) for r in rows]):.0f}s"
+            + (f" | ${mean(costs):.3f} |" if costs else " | n/a |"))
+
+
+def table_header() -> str:
+    cols = ["version", "queries×repeats", "factual", "citation", "complete", "source q.", "tool eff.",
+            "**overall**", "fact recall", "pass", "truncated", "avg cites", "avg time", "avg cost"]
+    return "| " + " | ".join(cols) + " |\n" + "|---" * len(cols) + "|"
+
+
+def per_query_table(rows: list[dict]) -> str:
+    from judge import mean, sd
+
+    by_q = defaultdict(list)
+    for r in rows:
+        by_q[r["id"]].append(r)
+    lines = ["| query | type | overall | fact recall | missing facts | cost |", "|---|---|---|---|---|---|"]
+    noise = []
+    for qid, rs in by_q.items():
+        ov = [r["overall"] for r in rs if not r.get("judge_error")]
+        if len(ov) > 1:
+            noise.append(sd(ov))
+        fr = [r["fact_recall"] for r in rs if r.get("fact_recall") is not None]
+        missing = sorted({m for r in rs for m in (r.get("facts_missing") or [])})
+        costs = [r["cost_usd"] for r in rs if r.get("cost_usd") is not None]
+        lines.append(f"| {qid} | {rs[0].get('type', '')} | {_fmt(ov)} | {_fmt(fr)} | {', '.join(missing) or '—'} | "
+                     + (f"${mean(costs):.3f}" if costs else "n/a") + " |")
+    if noise:
+        lines.append(f"\nRun-to-run noise: average per-query standard deviation of the overall score = {mean(noise):.3f}.")
+    return "\n".join(lines)
+
+
+def _write(rows: list[dict], label: str, stamp: str) -> Path:
+    RESULTS.mkdir(exist_ok=True)
+    path = RESULTS / f"{label}-{stamp}.json"
+    path.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+    md = f"{table_header()}\n{summary_row(rows)}\n\n{per_query_table(rows)}\n"
+    path.with_suffix(".md").write_text(md, encoding="utf-8")
+    return path
+
+
+def _table(paths: list[str]) -> int:
+    print(table_header())
+    for p in paths:
+        rows = json.loads(Path(p).read_text(encoding="utf-8"))
+        name = re.sub(r"-\d{8}-\d{6}$", "", Path(p).stem)  # results/<label>-<stamp>.json
+        print(summary_row(rows, None if rows and rows[0].get("label") else name))
+    return 0
+
+
+def _rejudge(path: str, args) -> int:
+    """Re-grade saved reports with another judge (evidence is stored with each row)."""
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO / ".env")
+    sys.path.insert(0, str(REPO))
+    from judge import deterministic_metrics, judge, make_judge
 
     rows = json.loads(Path(path).read_text(encoding="utf-8"))
-    runs = [d for d in (REPO / "data" / "runs").iterdir() if (d / "report.md").exists()]
-    judge_llm = _judge_llm()
+    judge_llm = make_judge(args.judge, args.judge_model)
     for r in rows:
-        evidence = r.get("evidence")
-        if not evidence:
-            state = {}
-            for d in runs:
-                if r["report"].startswith((d / "report.md").read_text(encoding="utf-8")[:2000]):
-                    state = {"sources": json.loads((d / "sources.json").read_text(encoding="utf-8"))}
-                    break
-            evidence = _evidence(state, r["report"])
         r.update(deterministic_metrics(r["report"]))
-        r.update(judge(judge_llm, r["query"], r["report"], evidence, r.get("process", "")))
-        r["evidence"] = evidence
-        print(f"  {r['id']}: overall {r['overall']:.2f} pass={r['pass']} · {r['notes'][:200]}", flush=True)
-    print("\n" + _write_summary(rows, label, CRITERIA))
+        if r["report"]:
+            r.update(judge(judge_llm, r["query"], r["report"], r.get("evidence", ""), r.get("process", "")))
+        r["label"], r["judge"], r["judge_error"] = args.label, args.judge, ""
+        print(f"  {r['id']} r{r.get('repeat', 0)}: overall {r['overall']:.2f} pass={r['pass']} · {r['notes'][:160]}",
+              flush=True)
+    out = _write(rows, args.label, f"{datetime.now():%Y%m%d-%H%M%S}")
+    print("\n" + out.with_suffix(".md").read_text(encoding="utf-8"))
     return 0
+
+
+# --------------------------------------------------------------------------- main
+
+
+def _queries(args) -> list[dict]:
+    qs = [json.loads(line) for line in (HERE / "queries.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    if args.ids:
+        want = set(args.ids.split(","))
+        qs = [q for q in qs if q["id"] in want]
+    if args.types:
+        want = set(args.types.split(","))
+        qs = [q for q in qs if q.get("type") in want]
+    return qs[: args.limit] if args.limit else qs
 
 
 def main() -> int:
@@ -151,68 +351,64 @@ def main() -> int:
             stream.reconfigure(encoding="utf-8")
         except Exception:
             pass
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", default="deepseek")
+    ap.add_argument("--system", choices=["jarvis", "baseline"], default="jarvis")
+    ap.add_argument("--ablation", choices=sorted(ABLATIONS), default="none")
+    ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--workers", type=int, default=1, help="parallel runs (each in its own process)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--ids", default="")
+    ap.add_argument("--types", default="", help="e.g. fact,survey")
+    ap.add_argument("--judge", default="deepseek", help="deepseek | anthropic | openai")
+    ap.add_argument("--judge-model", default="")
     ap.add_argument("--jarvis-path", default=str(REPO))
-    ap.add_argument("--label", default="current")
-    ap.add_argument("--rejudge", default="", help="re-grade a saved results .json with the current judge")
+    ap.add_argument("--label", default="")
+    ap.add_argument("--rejudge", default="", help="re-grade a saved results .json")
+    ap.add_argument("--table", nargs="+", default=None, help="print one comparison table from results .json files")
+    ap.add_argument("--job", default="", help=argparse.SUPPRESS)  # internal: one worker run "id:repeat"
+    ap.add_argument("--out", default="", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    args.label = args.label or (args.system if args.ablation == "none" else args.ablation)
 
     sys.path.insert(0, str(HERE))
+    if args.table:
+        return _table(args.table)
     if args.rejudge:
-        sys.path.insert(0, str(REPO))
-        return _rejudge(args.rejudge, args.label)
-    sys.path.insert(0, str(Path(args.jarvis_path).resolve()))
-    from langgraph.checkpoint.memory import MemorySaver
+        return _rejudge(args.rejudge, args)
 
-    import jarvis.graph as jgraph
-    import jarvis.llm as jllm
-    from judge import CRITERIA, deterministic_metrics, judge
+    jllm = _setup(args)
+    from judge import make_judge
 
-    if hasattr(jllm, "set_active_backend"):
-        jllm.set_active_backend(args.backend)
-    tracker = getattr(jllm, "usage", None)
+    queries = _queries(args)
+    judge_llm = make_judge(args.judge, args.judge_model or None)
 
-    queries = [json.loads(line) for line in (HERE / "queries.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
-    if args.ids:
-        want = set(args.ids.split(","))
-        queries = [q for q in queries if q["id"] in want]
-    if args.limit:
-        queries = queries[: args.limit]
+    if args.job:  # worker process: one run, result to --out
+        qid, rep = args.job.rsplit(":", 1)
+        row = run_job(next(q for q in queries if q["id"] == qid), int(rep), args, judge_llm)
+        Path(args.out).write_text(json.dumps(row), encoding="utf-8")
+        return 0
 
-    judge_llm = _judge_llm()
-    results = []
-    for q in queries:
-        print(f"\n=== [{args.label}] {q['id']}: {q['query']}", flush=True)
-        if tracker:
-            tracker.reset()
-        t0 = time.time()
-        try:
-            state = _drive(jgraph.build_graph(MemorySaver()), q["query"], args.backend)
-            error = ""
-        except Exception as exc:
-            state, error = {}, f"{type(exc).__name__}: {exc}"
-        secs = time.time() - t0
-        report = state.get("report") or ""
-        cost = tracker.cost(args.backend) if tracker else None
-        metrics = deterministic_metrics(report)
-        evidence = _evidence(state, report)
-        if report:
-            scores = judge(judge_llm, q["query"], report, evidence, _process(state, secs))
-        else:
-            scores = {**{c: 0.0 for c in CRITERIA}, "overall": 0.0, "pass": False, "notes": error or "no report"}
-        row = {"id": q["id"], "query": q["query"], "seconds": round(secs, 1), "cost_usd": cost, "error": error,
-               "process": _process(state, secs), **metrics, **scores, "report": report, "evidence": evidence}
-        results.append(row)
-        print(f"  overall {scores['overall']:.2f} pass={scores['pass']} · {row['process']} · "
-              f"cost {'$%.3f' % cost if cost is not None else 'n/a'} · truncated={metrics['looks_truncated']}", flush=True)
-        print(f"  notes: {scores['notes']}", flush=True)
+    if hasattr(jllm, "check_backend") and (problem := jllm.check_backend(args.backend)):
+        sys.exit(f"Can't run evals: {problem}")
+    jobs = [(q, r) for r in range(args.repeats) for q in queries]
+    stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+    print(f"== {args.label}: {len(queries)} queries × {args.repeats} repeat(s) · system={args.system} · "
+          f"ablation={args.ablation} · judge={args.judge} · workers={args.workers}", flush=True)
+    if args.workers > 1:
+        rows = _run_parallel(jobs, args, stamp)
+    else:
+        rows = []
+        for q, r in jobs:
+            print(f"\n=== [{args.label}] {q['id']} (repeat {r}): {q['query']}", flush=True)
+            row = run_job(q, r, args, judge_llm)
+            _print_row(row)
+            rows.append(row)
 
-    print("\n" + _write_summary(results, args.label, CRITERIA))
-    total = sum(r["cost_usd"] or 0 for r in results)
-    print(f"\nresearch cost (excl. judge): ${total:.3f}")
+    out = _write(rows, args.label, stamp)
+    print("\n" + out.with_suffix(".md").read_text(encoding="utf-8"))
+    total = sum(r.get("cost_usd") or 0 for r in rows)
+    print(f"research cost (excl. judge): ${total:.3f} · saved {out}")
     return 0
 
 

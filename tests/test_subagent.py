@@ -128,8 +128,23 @@ def test_compact_trims_old_tool_results_only():
             ToolMessage(content="A" * 5000, tool_call_id="call_search_web_0"),
             AIMessage(content="", tool_calls=[tool_call("search_web", {}, 1)]),
             ToolMessage(content="B" * 5000, tool_call_id="call_search_web_1")]
-    out = sa._compact(msgs, 3000)
+    out = sa._compact(msgs, 6000)  # stage 1 is enough: older result to 700 chars
     assert len(out[2].content) < 800 and out[4].content == "B" * 5000
+
+
+def test_compact_always_fits_the_window_but_keeps_instructions():
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    msgs = [SystemMessage("S" * 500), HumanMessage("task " * 100),
+            AIMessage(content="", tool_calls=[tool_call("search_web", {}, 0)]),
+            ToolMessage(content="A" * 5000, tool_call_id="call_search_web_0"),
+            AIMessage(content="", tool_calls=[tool_call("search_web", {}, 1), tool_call("search_arxiv", {}, 2)]),
+            ToolMessage(content="B" * 5000, tool_call_id="call_search_web_1"),
+            ToolMessage(content="C" * 5000, tool_call_id="call_search_arxiv_2")]
+    out = sa._compact(msgs, 3000)
+    assert sum(len(str(m.content)) for m in out) <= 3000 + 200  # within the window (+ trim notes)
+    assert out[0].content == "S" * 500 and out[1].content == "task " * 100  # never cut
+    assert "trimmed to fit" in out[5].content and len(out[5].content) == len(out[6].content)  # shared fairly
 
 
 def test_full_text_reads_have_their_own_allowance(monkeypatch):

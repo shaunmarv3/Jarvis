@@ -13,13 +13,15 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
+from . import llm as _llm
 from .banner import render_banner
 from .config import DATA_DIR, settings, subagent_ceiling
 from .graph import build_graph
-from .llm import active_backend, resolve_backend, set_active_backend, usage
+from .llm import active_backend, model_label, resolve_backend, set_active_backend, usage
+from .nodes import build_prior
 from .repl import COMMANDS, read_line, set_session_papers_getter
 from .tools.pdf_reader import summarize_paper
-from .utils import truncate
+from .utils import truncate, write_json_atomic
 
 console = Console()
 
@@ -34,6 +36,7 @@ _NODE_LABELS = {
     "cite": " citations attached",
 }
 _LAST_RUN = DATA_DIR / "last_run.json"
+_LAST_USAGE = DATA_DIR / "last_run_usage.json"  # token counts, saved after every LLM call
 
 
 def _build_help() -> str:
@@ -205,33 +208,46 @@ def _drive_until_done(graph, payload, config, busy: str) -> bool:
     return True
 
 
-def _show_report(graph, config, backend: str, seconds: float | None = None) -> list[dict]:
-    final = graph.get_state(config).values
+def _show_report(graph, config, backend: str, seconds: float | None = None) -> dict:
+    final = dict(graph.get_state(config).values)
     report = final.get("report") or "(no results)"
     console.print(Panel(Markdown(report), title="[bold green]report[/]", border_style="green"))
     _run_summary(final, backend, seconds)
-    return final.get("papers", [])
+    return final
 
 
-def _run_query(graph, query: str) -> list[dict]:
-    """Run one research request through the graph; returns the session papers."""
+def _backend_ready(backend: str) -> bool:
+    """Fail fast with a fix-it message instead of letting a dead backend produce a hollow report."""
+    problem = _llm.check_backend(backend)
+    if problem:
+        console.print(f"[red]can't start:[/] {problem}")
+        return False
+    return True
+
+
+def _run_query(graph, query: str, prior: dict | None = None) -> dict | None:
+    """Run one research request through the graph; returns the final state (None if it
+    didn't finish). `prior` is the previous run in this session, for follow-up questions."""
+    import time
+
     backend, notice = resolve_backend()
     if notice:
         console.print(f"[yellow]{notice}[/]")
+    if not _backend_ready(backend):
+        return None
 
     thread_id = uuid.uuid4().hex
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60}
     try:
-        _LAST_RUN.write_text(json.dumps({"thread_id": thread_id, "query": query, "backend": backend}), encoding="utf-8")
+        write_json_atomic(_LAST_RUN, {"thread_id": thread_id, "query": query, "backend": backend})
     except Exception:
         pass
-    import time
-
     usage.reset()
+    usage.attach(_LAST_USAGE, thread_id)  # so /resume after a crash still knows what was spent
     t0 = time.time()
-    init = {"messages": [HumanMessage(content=query)], "query": query, "backend": backend}
+    init = {"messages": [HumanMessage(content=query)], "query": query, "backend": backend, "prior": prior or {}}
     if not _drive_until_done(graph, init, config, busy="understanding your request"):
-        return []
+        return None
     return _show_report(graph, config, backend, time.time() - t0)
 
 
@@ -242,26 +258,37 @@ def _last_run() -> dict | None:
         return None
 
 
-def _resume(graph) -> list[dict]:
+def _resume(graph) -> dict | None:
     """Continue the last run from its latest checkpoint (after a crash or Ctrl+C)."""
+    import time
+
     last = _last_run()
     if not last:
         console.print("[dim]no previous run to resume[/]")
-        return []
-    config = {"configurable": {"thread_id": last["thread_id"]}, "recursion_limit": 60}
+        return None
+    thread_id = last["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60}
     snap = graph.get_state(config)
     if not snap or not snap.values:
         console.print("[dim]the last run has no saved checkpoint[/]")
-        return []
+        return None
     backend = last.get("backend", "ollama")
+    # Restore what the run already spent (saved after every LLM call), even after a restart.
+    usage.reset()
+    restored = usage.restore(_LAST_USAGE, thread_id)
+    usage.attach(_LAST_USAGE, thread_id)
     if not snap.next:
         console.print(f"[dim]the last run ({truncate(last.get('query', ''), 50)}) already finished — showing it[/]")
         return _show_report(graph, config, backend)
-    console.print(f"[cyan]resuming '{truncate(last.get('query', ''), 60)}' at: {', '.join(snap.next)}[/]")
+    if not _backend_ready(backend):
+        return None
+    console.print(f"[cyan]resuming '{truncate(last.get('query', ''), 60)}' at: {', '.join(snap.next)}[/]"
+                  + ("" if restored else " [dim](earlier token usage unknown)[/]"))
     set_active_backend(backend)
+    t0 = time.time()
     if not _drive_until_done(graph, None, config, busy="resuming"):
-        return []
-    return _show_report(graph, config, backend)
+        return None
+    return _show_report(graph, config, backend, time.time() - t0)
 
 
 def _show_sources(graph) -> None:
@@ -308,6 +335,8 @@ def _read_paper(papers: list[dict], idx: int) -> tuple[dict, str] | None:
         console.print(f"[red]no paper #{idx}[/] (have {len(papers)})")
         return None
     paper = papers[idx - 1]
+    if not _backend_ready(resolve_backend()[0]):
+        return None
     console.print(f"[dim]reading: {paper.get('title')} …[/]")
     with console.status("[cyan]downloading & summarizing…[/]"):
         out = summarize_paper(paper, backend=active_backend())
@@ -321,6 +350,9 @@ def _read_paper(papers: list[dict], idx: int) -> tuple[dict, str] | None:
         console.print(f"[dim]summary saved → {spath}[/]")
     except Exception as exc:
         console.print(f"[yellow]could not save summary: {exc}[/]")
+    if problem := _llm.check_embeddings():
+        console.print(f"[yellow]can't index this paper for /ask: {problem}[/]")
+        return None
     with console.status("[cyan]indexing for /ask…[/]"):
         ok, note, folder = ensure_indexed(paper)
     if ok:
@@ -378,6 +410,9 @@ def _ask(folder: str | None, question: str) -> str | None:
                 return None
 
     title = next((e["title"] for e in list_papers() if e["folder"] == folder), folder)
+    if problem := (_llm.check_embeddings() or _llm.check_backend(resolve_backend()[0])):
+        console.print(f"[red]can't answer:[/] {problem}")
+        return None
     with console.status("[cyan]thinking…[/]"):
         answer, docs = ask_folder(question, folder, backend=active_backend())
     console.print(Panel(Markdown(answer), title=f"[bold]Q&A · {truncate(title, 50)}[/]", border_style="magenta"))
@@ -451,7 +486,8 @@ def main() -> None:
     set_active_backend(settings.default_backend)
     try:
         console.clear()
-        render_banner(console, active_backend(), settings.ollama_model)
+        eff = resolve_backend()[0]  # what will really run (DeepSeek without a key runs Ollama)
+        render_banner(console, eff, model_label(eff))
     except Exception:
         console.print("[bold cyan]J A R V I S[/] — personal research agent")
     if resolve_backend()[0] == "deepseek":
@@ -460,6 +496,7 @@ def main() -> None:
     graph = build_graph()
     session_papers: list[dict] = []
     current_folder: str | None = None  # active paper's vector folder, target of /ask
+    session_prior: dict = {}  # the last finished run; the next question may follow up on it
     # Let the /save & /read dropdowns list the current search results (closure sees reassignments).
     set_session_papers_getter(lambda: session_papers)
 
@@ -473,129 +510,143 @@ def main() -> None:
             continue
 
         if line.startswith("/"):
-            parts = line.split(maxsplit=1)
-            cmd = parts[0].lower()
-            arg = parts[1].strip() if len(parts) > 1 else ""
+            try:
+                parts = line.split(maxsplit=1)
+                cmd = parts[0].lower()
+                arg = parts[1].strip() if len(parts) > 1 else ""
 
-            if cmd in {"/quit", "/exit", "/q"}:
-                console.print("[dim]bye 👋[/]")
-                break
-            elif cmd == "/help":
-                console.print(_HELP)
-            elif cmd == "/papers":
-                _show_papers(session_papers)
-            elif cmd == "/sources":
-                _show_sources(graph)
-            elif cmd == "/cost":
-                console.print(f"[dim]{usage.summary(active_backend())}[/]")
-            elif cmd == "/resume":
-                try:
-                    papers = _resume(graph)
-                    if papers:
-                        session_papers = papers
-                except KeyboardInterrupt:
-                    console.print("\n[yellow]interrupted — /resume continues from the last checkpoint[/]")
-                except Exception as exc:
-                    console.print(f"[red]error:[/] {exc}")
-            elif cmd == "/read":
-                if arg.isdigit():
-                    res = _read_paper(session_papers, int(arg))
-                    if res:
-                        current_folder = res[1]
-                else:
-                    console.print("[red]usage: /read <N>[/]")
-            elif cmd == "/db":
-                _list_db()
-            elif cmd == "/ask":
-                if arg:
-                    # Optional leading paper number (from the dropdown): "/ask 2 <question>".
-                    folder, question = current_folder, arg
-                    toks = arg.split(maxsplit=1)
-                    if toks[0].isdigit():
+                if cmd in {"/quit", "/exit", "/q"}:
+                    console.print("[dim]bye 👋[/]")
+                    break
+                elif cmd == "/help":
+                    console.print(_HELP)
+                elif cmd == "/papers":
+                    _show_papers(session_papers)
+                elif cmd == "/sources":
+                    _show_sources(graph)
+                elif cmd == "/cost":
+                    console.print(f"[dim]{usage.summary(active_backend())}[/]")
+                elif cmd == "/new":
+                    session_prior = {}
+                    console.print("[green]new topic[/] [dim]· the next question starts fresh instead of "
+                                  "building on the last report[/]")
+                elif cmd == "/resume":
+                    try:
+                        final = _resume(graph)
+                        if final:
+                            session_papers = final.get("papers") or session_papers
+                            session_prior = build_prior(final)
+                    except KeyboardInterrupt:
+                        console.print("\n[yellow]interrupted — /resume continues from the last checkpoint[/]")
+                    except Exception as exc:
+                        console.print(f"[red]error:[/] {exc}")
+                elif cmd == "/read":
+                    if arg.isdigit():
+                        res = _read_paper(session_papers, int(arg))
+                        if res:
+                            current_folder = res[1]
+                    else:
+                        console.print("[red]usage: /read <N>[/]")
+                elif cmd == "/db":
+                    _list_db()
+                elif cmd == "/ask":
+                    if arg:
+                        # Optional leading paper number (from the dropdown): "/ask 2 <question>".
+                        folder, question = current_folder, arg
+                        toks = arg.split(maxsplit=1)
+                        if toks[0].isdigit():
+                            from .store import list_papers
+
+                            dbp = list_papers()
+                            n = int(toks[0])
+                            if 1 <= n <= len(dbp):
+                                folder = dbp[n - 1]["folder"]
+                                question = toks[1] if len(toks) > 1 else ""
+                        if not question.strip():
+                            console.print("[yellow]add a question: /ask <N> <question>[/]")
+                        else:
+                            used = _ask(folder, question)
+                            if used:
+                                current_folder = used
+                    else:
+                        console.print("[red]usage: /ask <question>  (or /ask <N> <question>)[/]")
+                elif cmd == "/use":
+                    if arg.isdigit():
                         from .store import list_papers
 
-                        dbp = list_papers()
-                        n = int(toks[0])
-                        if 1 <= n <= len(dbp):
-                            folder = dbp[n - 1]["folder"]
-                            question = toks[1] if len(toks) > 1 else ""
-                    if not question.strip():
-                        console.print("[yellow]add a question: /ask <N> <question>[/]")
+                        papers_db = list_papers()
+                        if 1 <= int(arg) <= len(papers_db):
+                            current_folder = papers_db[int(arg) - 1]["folder"]
+                            console.print(f"[green]active paper → {truncate(papers_db[int(arg) - 1]['title'], 50)}[/]")
+                        else:
+                            console.print(f"[red]no DB paper #{arg}[/]")
                     else:
-                        used = _ask(folder, question)
-                        if used:
-                            current_folder = used
-                else:
-                    console.print("[red]usage: /ask <question>  (or /ask <N> <question>)[/]")
-            elif cmd == "/use":
-                if arg.isdigit():
-                    from .store import list_papers
-
-                    papers_db = list_papers()
-                    if 1 <= int(arg) <= len(papers_db):
-                        current_folder = papers_db[int(arg) - 1]["folder"]
-                        console.print(f"[green]active paper → {truncate(papers_db[int(arg) - 1]['title'], 50)}[/]")
+                        console.print("[red]usage: /use <N>[/]")
+                elif cmd == "/forget":
+                    if arg.isdigit():
+                        _forget(int(arg))
+                        current_folder = None
                     else:
-                        console.print(f"[red]no DB paper #{arg}[/]")
+                        console.print("[red]usage: /forget <N>[/]")
+                elif cmd == "/dataset":
+                    if arg:
+                        _search_datasets_cmd(arg)
+                    else:
+                        console.print("[red]usage: /dataset <query>[/]")
+                elif cmd == "/inspect":
+                    if arg:
+                        _inspect_dataset_cmd(arg)
+                    else:
+                        console.print("[red]usage: /inspect <hub_id>[/]")
+                elif cmd == "/web":
+                    if arg:
+                        _web_cmd(arg)
+                    else:
+                        console.print("[red]usage: /web <query>[/]")
+                elif cmd == "/save":
+                    if arg.isdigit():
+                        _save_paper(session_papers, int(arg))
+                    else:
+                        console.print("[red]usage: /save <N>[/]")
+                elif cmd == "/backend":
+                    if arg.lower() in {"ollama", "deepseek"}:
+                        set_active_backend(arg.lower())
+                        eff, notice = resolve_backend()  # effective backend (may fall back)
+                        mode = "parallel" if eff == "deepseek" else "sequential"
+                        console.print(
+                            f"[green]backend → {eff}[/] "
+                            f"[dim]· up to {subagent_ceiling(eff)} subagents ({mode})[/]"
+                        )
+                        if eff == "deepseek":
+                            console.print(f"[dim]lead: {settings.deepseek_lead_model} · subagents: {settings.deepseek_worker_model}[/]")
+                        if notice:
+                            console.print(f"[yellow]{notice}[/]")
+                    else:
+                        console.print("[red]usage: /backend ollama|deepseek[/]")
+                elif cmd == "/model":
+                    if arg:
+                        settings.ollama_model = arg
+                        console.print(f"[green]ollama model → {arg}[/]")
+                    else:
+                        console.print("[red]usage: /model <name>[/]")
                 else:
-                    console.print("[red]usage: /use <N>[/]")
-            elif cmd == "/forget":
-                if arg.isdigit():
-                    _forget(int(arg))
-                    current_folder = None
-                else:
-                    console.print("[red]usage: /forget <N>[/]")
-            elif cmd == "/dataset":
-                if arg:
-                    _search_datasets_cmd(arg)
-                else:
-                    console.print("[red]usage: /dataset <query>[/]")
-            elif cmd == "/inspect":
-                if arg:
-                    _inspect_dataset_cmd(arg)
-                else:
-                    console.print("[red]usage: /inspect <hub_id>[/]")
-            elif cmd == "/web":
-                if arg:
-                    _web_cmd(arg)
-                else:
-                    console.print("[red]usage: /web <query>[/]")
-            elif cmd == "/save":
-                if arg.isdigit():
-                    _save_paper(session_papers, int(arg))
-                else:
-                    console.print("[red]usage: /save <N>[/]")
-            elif cmd == "/backend":
-                if arg.lower() in {"ollama", "deepseek"}:
-                    set_active_backend(arg.lower())
-                    eff, notice = resolve_backend()  # effective backend (may fall back)
-                    mode = "parallel" if eff == "deepseek" else "sequential"
-                    console.print(
-                        f"[green]backend → {eff}[/] "
-                        f"[dim]· up to {subagent_ceiling(eff)} subagents ({mode})[/]"
-                    )
-                    if eff == "deepseek":
-                        console.print(f"[dim]lead: {settings.deepseek_lead_model} · subagents: {settings.deepseek_worker_model}[/]")
-                    if notice:
-                        console.print(f"[yellow]{notice}[/]")
-                else:
-                    console.print("[red]usage: /backend ollama|deepseek[/]")
-            elif cmd == "/model":
-                if arg:
-                    settings.ollama_model = arg
-                    console.print(f"[green]ollama model → {arg}[/]")
-                else:
-                    console.print("[red]usage: /model <name>[/]")
-            else:
-                console.print(f"[red]unknown command {cmd}[/] — try /help")
+                    console.print(f"[red]unknown command {cmd}[/] — try /help")
+            except KeyboardInterrupt:
+                console.print("\n[yellow]interrupted[/]")
+            except Exception as exc:  # a failing command must not kill the REPL
+                console.print(f"[red]error:[/] {exc}")
             continue
 
-        # Free text → run the research graph.
+        # Free text → run the research graph (it may follow up on the previous run).
         try:
-            papers = _run_query(graph, line)
-            if papers:
-                session_papers = papers
-                console.print(f"[dim]· {len(papers)} papers available — /papers, /read N · /sources for everything[/]")
+            final = _run_query(graph, line, session_prior)
+            if final:
+                papers = final.get("papers") or []
+                if papers:
+                    session_papers = papers
+                    console.print(f"[dim]· {len(papers)} papers available — /papers, /read N · /sources for everything[/]")
+                session_prior = build_prior(final)
+                console.print("[dim]· ask a follow-up (it builds on this report) · /new to start a fresh topic[/]")
         except KeyboardInterrupt:
             console.print("\n[yellow]interrupted — /resume continues from the last checkpoint[/]")
         except Exception as exc:  # keep the REPL alive

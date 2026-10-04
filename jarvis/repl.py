@@ -21,6 +21,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("/save", "<N>", "download paper N's PDF to data/papers"),
     ("/papers", "", "list the last run's papers (cited first)"),
     ("/sources", "", "list every source the last run retrieved (papers, web, code, data, community)"),
+    ("/new", "", "start a fresh topic (the next question won't build on the last report)"),
     ("/resume", "", "resume the last research run if it was interrupted or crashed"),
     ("/cost", "", "token usage & estimated cost of the last run"),
     ("/dataset", "<query>", "quick HuggingFace dataset search"),

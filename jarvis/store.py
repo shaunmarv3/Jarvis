@@ -17,22 +17,47 @@ from datetime import datetime
 
 from .config import VECTOR_DIR
 from .embeddings import get_embeddings
-from .utils import chunk_text
+from .utils import chunk_text, write_json_atomic
 
 _REGISTRY = VECTOR_DIR / "registry.json"
+_META = "jarvis_meta.json"  # each store folder also keeps its own registry entry
+
+
+def _rebuild_registry() -> list[dict]:
+    """Recreate the registry from the store folders on disk (each holds its own entry).
+    Folders indexed before entries were stored per folder get a minimal entry."""
+    reg = []
+    for d in sorted(p for p in VECTOR_DIR.iterdir() if p.is_dir() and re.fullmatch(r".+__\d{9}", p.name)):
+        try:
+            reg.append(json.loads((d / _META).read_text(encoding="utf-8")))
+        except Exception:
+            reg.append({"folder": d.name, "paper_id": "", "title": d.name.split("__")[0].replace("-", " "),
+                        "created_at": "", "chunks": ""})
+    return reg
 
 
 def _load_registry() -> list[dict]:
-    if _REGISTRY.exists():
-        try:
-            return json.loads(_REGISTRY.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-    return []
+    if not _REGISTRY.exists():
+        return []
+    try:
+        reg = json.loads(_REGISTRY.read_text(encoding="utf-8"))
+        if isinstance(reg, list):
+            return reg
+    except Exception:
+        pass
+    # Corrupt registry: keep the bad file for inspection and rebuild from the folders, so a
+    # later save can't silently drop every paper indexed before.
+    try:
+        _REGISTRY.replace(_REGISTRY.with_name(f"registry.corrupt-{datetime.now():%Y%m%d-%H%M%S}.json"))
+    except Exception:
+        pass
+    reg = _rebuild_registry()
+    _save_registry(reg)
+    return reg
 
 
 def _save_registry(reg: list[dict]) -> None:
-    _REGISTRY.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+    write_json_atomic(_REGISTRY, reg)
 
 
 def _pid(paper: dict) -> str:
@@ -90,16 +115,16 @@ def index_paper(paper: dict, text: str) -> tuple[str, int]:
         metadatas=[{"chunk": i} for i in range(len(chunks))],
         ids=[str(i) for i in range(len(chunks))],
     )
+    entry = {
+        "folder": folder,
+        "paper_id": _pid(paper),
+        "title": paper.get("title", ""),
+        "created_at": now.isoformat(timespec="seconds"),
+        "chunks": len(chunks),
+    }
+    write_json_atomic(VECTOR_DIR / folder / _META, entry)
     reg = _load_registry()
-    reg.append(
-        {
-            "folder": folder,
-            "paper_id": _pid(paper),
-            "title": paper.get("title", ""),
-            "created_at": now.isoformat(timespec="seconds"),
-            "chunks": len(chunks),
-        }
-    )
+    reg.append(entry)
     _save_registry(reg)
     return folder, len(chunks)
 

@@ -28,4 +28,8 @@ class AgentState(TypedDict, total=False):
     followup_done: bool
     report: str  # final report text (with numbered citations)
     citation_stats: dict  # {"cited", "invalid_tags", "retrieved"}
+    cited_sids: list  # source ids in citation order: [1] -> cited_sids[0]
     papers: list  # papers for /read and /papers (cited first)
+    # Conversation memory: the previous run in this session, given by the CLI.
+    prior: dict  # {"query", "brief", "findings" (report body with [S#] tags), "sources": {sid: entry}}
+    follow_up: bool  # clarify decided this request builds on `prior`

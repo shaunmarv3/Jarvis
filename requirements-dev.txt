@@ -1,2 +1,3 @@
 -r requirements.txt
 pytest>=8.0
+anthropic>=0.40  # evals: Claude as a cross-family judge

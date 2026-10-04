@@ -10,9 +10,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 
-import requests
-
-from ..config import PAPERS_DIR, settings
+from ..config import PAPERS_DIR
 from ..utils import truncate
 from . import _http
 
@@ -93,14 +91,11 @@ def arxiv_fetch(id_or_url: str, download: bool = True) -> dict:
             return {"papers": [], "text": f"arXiv has no paper {aid}."}
         paper = papers[0]
         if download:
+            from .reader import save_pdf
+
             path = PAPERS_DIR / f"{aid}.pdf"
-            if not path.exists():
-                resp = requests.get(
-                    paper["pdf_url"], timeout=settings.request_timeout * 2,
-                    headers={"User-Agent": _http.UA},
-                )
-                resp.raise_for_status()
-                path.write_bytes(resp.content)
+            if not save_pdf(paper["pdf_url"], path):
+                return {"papers": [paper], "text": f"arXiv:{aid} metadata fetched, but its PDF link did not return a PDF."}
             paper["local_path"] = str(path)
     except Exception as exc:
         return {"papers": [], "text": f"arXiv fetch failed for {aid}: {exc}"}
