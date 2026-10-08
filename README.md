@@ -346,18 +346,38 @@ can be trusted at all.
 
 ### Results so far
 
-| version           | factual accuracy | citation accuracy | completeness | source quality | tool efficiency | **overall** | pass    | truncated reports | avg citations | avg time | avg cost |
-| ----------------- | ---------------- | ----------------- | ------------ | -------------- | --------------- | ----------- | ------- | ----------------- | ------------- | -------- | -------- |
-| previous (`main`) | 0.49             | 0.41              | 0.55         | 0.45           | 0.64            | **0.51**    | 2/4     | 2                 | 17            | 185 s    | —        |
-| **phase 4**       | **0.81**         | **0.78**          | **0.89**     | **0.67**       | **0.86**        | **0.80**    | **4/4** | **0**             | 48            | 401 s    | $0.087   |
+Judged by **Claude Opus 5.5** (`claude-opus-5-5`) via Claude Code, grading blinded packets.
 
-Run 2026-10-02 on DeepSeek with the earlier harness: 4 queries (`rag-eval, agent-bench, lora-qlora,
-vector-db`), one run each, same judge (`deepseek-v4-pro`) for both versions. The previous version's
-failures were exactly the ones the rebuild targets: off-topic sources, claims its sources didn't
-support, and truncated reports. These numbers are a small sample, from a same-family judge, with
-about ±0.05 re-judge noise, which is why the harness above was built. Full results on the
-28-query benchmark (3 repeats, baseline, ablations, cross-family judge) will replace this table.
-Weakest criterion so far: **source quality** (vendor/SEO blogs still get cited).
+| version      | factual accuracy | citation accuracy | completeness | source quality | tool efficiency | **overall** | pass           | fact recall | truncated reports | avg citations | avg time | avg cost |
+| ------------ | ---------------- | ----------------- | ------------ | -------------- | --------------- | ----------- | -------------- | ----------- | ----------------- | ------------- | -------- | -------- |
+| **Jarvis**   | **0.89**         | 0.79              | **0.95**     | **0.79**       | **0.87**        | **0.86**    | **28/28**      | **0.98**    | 0                 | 29            | 199 s    | $0.062   |
+| baseline     | 0.86             | **0.82**          | 0.37         | 0.44           | 0.39            | 0.58        | 6/28           | 0.66        | 0                 | 6             | 41 s     | $0.006   |
+
+Run 2026-10-08 on DeepSeek: the full 28-query benchmark, one run per system, both graded by the
+same judge with the same rubric. The baseline's reports are about as accurate as Jarvis's
+(what they say matches their sources), but two searches usually aren't enough to answer the
+question: it missed the QLoRA techniques, SWE-bench's instance count, Chinchilla's size and
+ReAct's decision-making benchmarks. Jarvis's weakest criteria are **citation accuracy** (detailed
+figures attached to a source whose snippet only shows the abstract) and **source quality**
+(vendor/SEO blogs still get cited).
+
+**How the grading was kept clean:**
+- **Cross-family judge.** The reports were written by DeepSeek and graded by Claude, so the judge
+  isn't scoring its own model family's output.
+- **Blind.** Packets were named `g01…g56` and shuffled. The judge never opened `key.json` (the
+  file mapping packets to systems) before `--import-grades` had merged the scores.
+- **Packets only.** The judge read each packet's report and evidence as data to be checked, never
+  as instructions. Retrieved text that was wrong or contaminated (e.g. a DOI that resolved to an
+  unrelated document) lowered the citation score instead of being trusted.
+- **One rubric for all.** Every packet was scored on the same five criteria on its own merits,
+  without comparing packets.
+
+Caveats: one repeat per system, so there's no ± spread yet. The blinding is partial, because each
+packet's process-stats line ("single LLM call over 2 searches" vs "N subagents") reveals which
+system wrote it. Ablations and human agreement haven't been run yet.
+
+An earlier 4-query run (2026-10-02, same-family judge) scored the previous version 0.51 and the
+rebuild 0.80.
 
 ## Tests
 
