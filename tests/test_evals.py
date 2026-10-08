@@ -152,3 +152,59 @@ def test_missing_judge_key_fails_with_a_clear_message(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(SystemExit, match="ANTHROPIC_API_KEY missing"):
         judge.make_judge("anthropic")
+
+
+# --------------------------------------------------------------------------- grading outside the harness
+
+
+def test_judge_none_saves_reports_ungraded(monkeypatch):
+    assert judge.make_judge("none") is None
+    monkeypatch.setattr(run_evals, "_drive", lambda *a: {"report": "QLoRA uses NF4 [1].\n\n## Sources\n- [1] Q — https://x"})
+    args = type("A", (), {"system": "jarvis", "backend": "ollama", "label": "jarvis", "ablation": "none",
+                          "judge": "none"})()
+    row = run_evals.run_job({"id": "q", "query": "qlora?", "facts": [["NF4"]]}, 0, args, None)
+    assert row["graded"] is False and row["fact_recall"] == 1.0 and row["report"]
+    line = run_evals.summary_row([row])
+    assert "| 1.00 |" in line  # fact recall is measured in code, before any grading
+    assert "| — | — | — | — | — | — |" in line  # judge scores wait for grades
+
+
+def test_export_is_blind_and_import_matches_the_automated_judge(tmp_path):
+    import grading
+
+    rows = [{**_row("a", 0, 0.0), "graded": False, "report": "report A", "evidence": "ev A", "process": "p"},
+            {**_row("b", 0, 0.0), "graded": False, "report": "report B", "evidence": "ev B", "process": "p"},
+            {**_row("c", 0, 0.0), "report": "", "error": "crashed"}]  # no report: nothing to grade
+    src = tmp_path / "jarvis-1.json"
+    src.write_text(json.dumps(rows), encoding="utf-8")
+    folder = grading.export([str(src)], out_root=tmp_path / "grading", seed=1)
+
+    packets = sorted(p.name for p in (folder / "packets").glob("*.md"))
+    assert packets == ["g01.md", "g02.md"]
+    text = (folder / "packets" / "g01.md").read_text(encoding="utf-8")
+    assert "Score each criterion" in text and "jarvis" not in text.lower()  # the rubric, but no system name
+    key = json.loads((folder / "key.json").read_text(encoding="utf-8"))
+    by_id = {v["id"]: k for k, v in key.items()}
+
+    good = {c: 0.8 for c in judge.CRITERIA} | {"pass": True, "notes": "solid"}
+    grades = {by_id["a"]: good, by_id["b"]: {**good, "completeness": 7}}  # b: out of range
+    (folder / "grades.json").write_text(json.dumps(grades), encoding="utf-8")
+    files, problems = grading.import_grades(folder, "manual:claude")
+
+    out = files[str(src.resolve())]
+    assert out[0]["graded"] and out[0]["overall"] == judge.parse_scores(good)["overall"] == 0.8
+    assert out[0]["judge"] == "manual:claude" and out[0]["notes"] == "solid"
+    assert out[1]["graded"] is False and any("completeness" in p for p in problems)
+    assert json.loads(src.read_text(encoding="utf-8"))[0]["graded"] is False  # the original file is untouched
+    # b (invalid grade) is left out; c (crashed, no report) counts as 0, as with a model judge.
+    assert "| 0.40 |" in run_evals.summary_row(out)
+
+
+def test_grade_validation():
+    import grading
+
+    ok = {c: 0.5 for c in judge.CRITERIA} | {"pass": False}
+    assert grading.validate(ok) is None
+    assert "pass" in grading.validate({**ok, "pass": "yes"})
+    assert "factual_accuracy" in grading.validate({**ok, "factual_accuracy": True})
+    assert grading.validate(None) == "not a JSON object"

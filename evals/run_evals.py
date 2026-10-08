@@ -7,6 +7,9 @@
   python evals/run_evals.py --judge anthropic                  # cross-family judge (no self-preference)
   python evals/run_evals.py --jarvis-path ../old --label prev  # grade another checkout
   python evals/run_evals.py --rejudge results/x.json --judge anthropic --label x-claude
+  python evals/run_evals.py --judge none --workers 6           # research only; grade later, by hand:
+  python evals/run_evals.py --export-grading results/a.json results/b.json   # blinded packets (grading.py)
+  python evals/run_evals.py --import-grades evals/grading/<stamp> --label claude
   python evals/run_evals.py --table results/a.json results/b.json   # one comparison table
 
 Grading = one LLM-judge call on Anthropic's 5-criterion rubric + checks done in code
@@ -145,8 +148,11 @@ def run_job(q: dict, repeat: int, args, judge_llm) -> dict:
     recall, missing = fact_recall(report, q.get("facts"))
     evidence = _evidence(state, report)
     process = _process(state, secs, args.system)
-    judge_error = ""
-    if report:
+    judge_error, graded = "", True
+    if report and judge_llm is None:  # --judge none: grade later from blinded packets (grading.py)
+        scores = {**{c: 0.0 for c in CRITERIA}, "overall": 0.0, "pass": False, "notes": "not graded yet"}
+        graded = False
+    elif report:
         try:
             scores = judge(judge_llm, q["query"], report, evidence, process)
         except Exception as exc:
@@ -158,6 +164,7 @@ def run_job(q: dict, repeat: int, args, judge_llm) -> dict:
         "id": q["id"], "type": q.get("type", ""), "query": q["query"], "repeat": repeat,
         "label": args.label, "system": args.system, "ablation": args.ablation,
         "judge": f"{args.judge}:{getattr(judge_llm, 'model', getattr(judge_llm, 'model_name', ''))}",
+        "graded": graded,
         "seconds": round(secs, 1), "cost_usd": cost, "error": error, "judge_error": judge_error,
         "process": process, **deterministic_metrics(report),
         "fact_recall": recall, "facts_missing": missing, **scores,
@@ -165,10 +172,16 @@ def run_job(q: dict, repeat: int, args, judge_llm) -> dict:
     }
 
 
+def _scored(row: dict) -> bool:
+    """Rows whose scores count: graded, and the judge didn't fail on them."""
+    return not row.get("judge_error") and row.get("graded", True)
+
+
 def _print_row(row: dict) -> None:
     fr = "" if row["fact_recall"] is None else f" · facts {row['fact_recall']:.2f}"
     cost = f"${row['cost_usd']:.3f}" if row.get("cost_usd") is not None else "n/a"
-    print(f"  [{row['id']} r{row['repeat']}] overall {row['overall']:.2f}{fr} pass={row['pass']} · "
+    score = f"overall {row['overall']:.2f} pass={row['pass']}" if row.get("graded", True) else "ungraded"
+    print(f"  [{row['id']} r{row['repeat']}] {score}{fr} · "
           f"{row['process']} · {cost} · truncated={row['looks_truncated']}", flush=True)
     if row.get("error") or row.get("judge_error"):
         print(f"    ! {row.get('error') or row.get('judge_error')}", flush=True)
@@ -241,22 +254,25 @@ def summary_row(rows: list[dict], label: str | None = None) -> str:
     from judge import mean
 
     crit = _criteria()
-    graded = [r for r in rows if not r.get("judge_error")]
-    by_rep = defaultdict(list)
-    for r in graded:
-        by_rep[r.get("repeat", 0)].append(r)
+    by_rep, all_by_rep = defaultdict(list), defaultdict(list)
+    for r in rows:
+        all_by_rep[r.get("repeat", 0)].append(r)
+        if _scored(r):
+            by_rep[r.get("repeat", 0)].append(r)
 
-    def per_rep(fn):
-        vals = [fn(rs) for rs in by_rep.values()]
+    def per_rep(fn, groups=by_rep):
+        vals = [fn(rs) for rs in groups.values()]
         return [v for v in vals if v == v]  # drop NaN
 
     cells = [_fmt(per_rep(lambda rs, c=c: mean([r[c] for r in rs]))) for c in crit + ["overall"]]
-    cells.append(_fmt(per_rep(lambda rs: mean([r["fact_recall"] for r in rs if r.get("fact_recall") is not None]))))
+    # Fact recall is measured in code, so it counts even before a report is graded.
+    cells.append(_fmt(per_rep(lambda rs: mean([r["fact_recall"] for r in rs if r.get("fact_recall") is not None]),
+                              all_by_rep)))
     cells.append(_fmt(per_rep(lambda rs: mean([1.0 if r["pass"] else 0.0 for r in rs])), pct=True))
     costs = [r["cost_usd"] for r in rows if r.get("cost_usd") is not None]
     label = label or (rows[0].get("label") if rows else None) or "?"
     n_q = len({r["id"] for r in rows})
-    return (f"| {label} | {n_q}×{len(by_rep) or 1} | " + " | ".join(cells)
+    return (f"| {label} | {n_q}×{len(all_by_rep) or 1} | " + " | ".join(cells)
             + f" | {sum(bool(r.get('looks_truncated')) for r in rows)}"
             + f" | {mean([r.get('citations_in_text', 0) for r in rows]):.0f}"
             + f" | {mean([r.get('seconds', 0) for r in rows]):.0f}s"
@@ -278,7 +294,7 @@ def per_query_table(rows: list[dict]) -> str:
     lines = ["| query | type | overall | fact recall | missing facts | cost |", "|---|---|---|---|---|---|"]
     noise = []
     for qid, rs in by_q.items():
-        ov = [r["overall"] for r in rs if not r.get("judge_error")]
+        ov = [r["overall"] for r in rs if _scored(r)]
         if len(ov) > 1:
             noise.append(sd(ov))
         fr = [r["fact_recall"] for r in rs if r.get("fact_recall") is not None]
@@ -319,6 +335,8 @@ def _rejudge(path: str, args) -> int:
 
     rows = json.loads(Path(path).read_text(encoding="utf-8"))
     judge_llm = make_judge(args.judge, args.judge_model)
+    if judge_llm is None:
+        sys.exit("--rejudge needs a model judge; to grade by hand use --export-grading instead.")
     for r in rows:
         r.update(deterministic_metrics(r["report"]))
         if r["report"]:
@@ -328,6 +346,25 @@ def _rejudge(path: str, args) -> int:
               flush=True)
     out = _write(rows, args.label, f"{datetime.now():%Y%m%d-%H%M%S}")
     print("\n" + out.with_suffix(".md").read_text(encoding="utf-8"))
+    return 0
+
+
+def _import_grades(folder: str, args) -> int:
+    """Write graded copies of the exported results files (originals stay untouched)."""
+    from grading import import_grades
+
+    grader = args.label if args.label not in {"", "jarvis"} else "external"  # label defaults to the system
+    files, problems = import_grades(folder, judge_name=f"manual:{grader}")
+    stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+    for src, rows in files.items():
+        source_label = (rows[0].get("label") if rows else "") or Path(src).stem
+        label = f"{grader}-{source_label}"
+        for r in rows:
+            r["label"] = label
+        out = _write(rows, label, stamp)
+        print(out.with_suffix(".md").read_text(encoding="utf-8").split("\n\n")[0] + f"\n→ {out}\n")
+    if problems:
+        print(f"{len(problems)} packet(s) not imported (left out of the scores):\n  " + "\n  ".join(problems))
     return 0
 
 
@@ -360,12 +397,17 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--ids", default="")
     ap.add_argument("--types", default="", help="e.g. fact,survey")
-    ap.add_argument("--judge", default="deepseek", help="deepseek | anthropic | openai")
+    ap.add_argument("--judge", default="deepseek",
+                    help="deepseek | anthropic | openai | none (save ungraded; grade later with --export-grading)")
     ap.add_argument("--judge-model", default="")
     ap.add_argument("--jarvis-path", default=str(REPO))
     ap.add_argument("--label", default="")
     ap.add_argument("--rejudge", default="", help="re-grade a saved results .json")
     ap.add_argument("--table", nargs="+", default=None, help="print one comparison table from results .json files")
+    ap.add_argument("--export-grading", nargs="+", default=None, metavar="RESULTS_JSON",
+                    help="write blinded judge packets for grading outside the harness (Claude Code / a person)")
+    ap.add_argument("--import-grades", default="", metavar="GRADING_DIR",
+                    help="merge a filled-in grading folder back into results files (name the grader with --label)")
     ap.add_argument("--job", default="", help=argparse.SUPPRESS)  # internal: one worker run "id:repeat"
     ap.add_argument("--out", default="", help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -376,6 +418,15 @@ def main() -> int:
         return _table(args.table)
     if args.rejudge:
         return _rejudge(args.rejudge, args)
+    if args.export_grading:
+        from grading import export
+
+        folder = export(args.export_grading)
+        n = len(list((folder / "packets").glob("*.md")))
+        print(f"{n} blinded packets → {folder}\nInstructions for the grader: {folder / 'README.md'}")
+        return 0
+    if args.import_grades:
+        return _import_grades(args.import_grades, args)
 
     jllm = _setup(args)
     from judge import make_judge

@@ -9,7 +9,8 @@ the share of known-correct facts a report states, for queries that have a ground
 answer (e.g. "QLoRA fine-tunes a 65B model on one 48GB GPU").
 
 Judges from three providers can grade the same reports. Using a model family other than
-the agent's (DeepSeek) removes self-preference bias.
+the agent's (DeepSeek) removes self-preference bias. With `--judge none` the reports are
+saved ungraded and graded later from blinded packets (evals/grading.py).
 """
 
 from __future__ import annotations
@@ -166,10 +167,16 @@ JUDGE_KEYS = {"deepseek": "DEEPSEEK_API_KEY", "anthropic": "ANTHROPIC_API_KEY", 
 
 
 def make_judge(provider: str = "deepseek", model: str | None = None):
-    """Build a judge model. Keys come from the environment / .env."""
+    """Build a judge model. Keys come from the environment / .env.
+
+    "none" returns None: reports are saved ungraded, to be graded later outside the harness
+    (see evals/grading.py: blinded packets for Claude Code or a person, then --import-grades).
+    """
     provider = provider.lower()
+    if provider == "none":
+        return None
     if provider not in JUDGE_KEYS:
-        raise SystemExit(f"Unknown judge provider '{provider}'. Use deepseek, anthropic or openai.")
+        raise SystemExit(f"Unknown judge provider '{provider}'. Use deepseek, anthropic, openai or none.")
     if not os.environ.get(JUDGE_KEYS[provider]):
         raise SystemExit(f"{JUDGE_KEYS[provider]} missing in .env — the {provider} judge needs it.")
     if provider == "anthropic":
@@ -191,12 +198,18 @@ def make_judge(provider: str = "deepseek", model: str | None = None):
     )
 
 
+def judge_prompt(query: str, report: str, evidence: str, process: str) -> str:
+    return JUDGE_PROMPT.format(query=query, report=report[:60000], evidence=evidence[:150000], process=process)
+
+
 def judge(llm, query: str, report: str, evidence: str, process: str) -> dict:
     from jarvis.utils import extract_json
 
-    raw = llm.invoke(JUDGE_PROMPT.format(query=query, report=report[:60000], evidence=evidence[:150000],
-                                         process=process)).content
-    data = extract_json(raw)
+    return parse_scores(extract_json(llm.invoke(judge_prompt(query, report, evidence, process)).content))
+
+
+def parse_scores(data: dict) -> dict:
+    """A judge's JSON reply -> clamped criterion scores, overall, pass and notes."""
     out = {}
     for c in CRITERIA:
         try:

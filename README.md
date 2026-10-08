@@ -71,7 +71,7 @@ and its open-sourced [lead / subagent prompts](https://github.com/anthropics/cla
   tool runs.
 - **Chat with a paper** — `/read N` summarizes a paper and indexes it in its own vector store;
   `/ask` answers from that paper only.
-- **Measured** — 108 offline tests + CI, and an eval harness with 28 benchmark queries, repeated
+- **Measured** — 111 offline tests + CI, and an eval harness with 28 benchmark queries, repeated
   runs, known-answer fact checks, ablations, a simple baseline, a cross-family judge and a
   human-agreement check.
 
@@ -323,6 +323,20 @@ python evals/human.py export evals/results/jarvis-X.json --n 10   # blind sheet 
 python evals/human.py agree  evals/results/jarvis-X.json evals/human/jarvis-X/grades.csv
 ```
 
+**Grading without a judge API key.** `--judge none` saves the reports ungraded (research cost
+only). `--export-grading` then writes one blinded packet per report: the judge's exact prompt,
+named `g01, g02, …` and shuffled across the files, so the grader can't tell Jarvis from the
+baseline by file name or order. Claude Code (on a normal subscription) or a person fills in
+`grades.json` with the same rubric, and `--import-grades` merges the scores into new results
+files that `--table` reads like any other:
+
+```bash
+python evals/run_evals.py --judge none --workers 6
+python evals/run_evals.py --system baseline --judge none --workers 6
+python evals/run_evals.py --export-grading evals/results/jarvis-X.json evals/results/baseline-Y.json
+python evals/run_evals.py --import-grades evals/grading/<stamp> --label claude
+```
+
 Each score is reported as the mean over repeats ± the spread between repeats. The per-query
 table lists which facts each report missed and the run-to-run noise. The **baseline** answers
 "is the multi-agent cost worth it?". The **ablations** each switch off one design piece (the
@@ -349,7 +363,7 @@ Weakest criterion so far: **source quality** (vendor/SEO blogs still get cited).
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 108 tests, no network, no LLM (fake models + fake tools)
+pytest -q          # 111 tests, no network, no LLM (fake models + fake tools)
 python scripts/smoke.py deepseek "your question"   # one real end-to-end run
 python scripts/smoke.py ollama "q" --follow-up "compare that with X"   # also exercises memory
 ```
@@ -398,8 +412,8 @@ Jarvis/                          (repo root)
 │       ├── datasets.py · hf_models.py · hf_inspect.py   HuggingFace datasets & models
 │       ├── community.py         Hacker News (+ Reddit, currently blocked)
 │       └── pdf_reader.py        map-reduce paper summaries for /read
-├── tests/                       108 offline tests (fake LLM + fake tools)
-├── evals/                       queries.jsonl (28) · run_evals.py · judge.py · baseline.py · human.py · results/
+├── tests/                       111 offline tests (fake LLM + fake tools)
+├── evals/                       queries.jsonl (28) · run_evals.py · judge.py · grading.py · baseline.py · human.py · results/
 ├── scripts/                     smoke.py (real run, optional follow-up) · test_commands.py (CLI commands)
 ├── .github/workflows/ci.yml     pytest on push to main / PRs
 ├── requirements.txt · requirements-dev.txt · pyproject.toml
