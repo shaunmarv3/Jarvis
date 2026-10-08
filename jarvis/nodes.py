@@ -23,8 +23,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import interrupt
 
 from .config import REPORTS_DIR, RUNS_DIR, default_budget, lead_iteration_enabled, settings, subagent_ceiling
-from .events import emit
+from .events import emit, note
 from .llm import get_llm, input_char_budget
+from .memory import prompt_block as _memory_block
 from .prompts import (
     BRIEF_PROMPT,
     CLARIFY_PROMPT,
@@ -69,10 +70,24 @@ def _fit(build, levels: list[tuple], budget: int | None, what: str) -> str:
         prompt = build(*level)
         if budget is None or len(prompt) <= budget:
             if i:
-                emit(f"[dim]· trimmed {what} to fit the {settings.ollama_num_ctx}-token context window[/]")
+                note(f"Trimmed {what} to fit the {settings.ollama_num_ctx}-token context window")
             return prompt
-    emit(f"[yellow]  ! {what} is still longer than the context window after trimming — the model may miss some of it[/]")
+    note(f"{what[:1].upper()}{what[1:]} is still longer than the context window after trimming; "
+         "the model may miss some of it", "warn")
     return prompt
+
+
+def _memory(state: AgentState) -> str:
+    """The user's standing preferences (data/memory.md) as a prompt section, or ''."""
+    return _memory_block(state.get("memory") or "", state.get("backend"))
+
+
+def short_title(text: str, n: int = 44) -> str:
+    """A label-sized version of a long objective, cut at a word boundary."""
+    t = re.sub(r"\s+", " ", text or "").strip()
+    if len(t) <= n:
+        return t
+    return (t[: n - 1].rsplit(" ", 1)[0] or t[: n - 1]).rstrip(" ,.;:-") + "…"
 
 
 # --------------------------------------------------------------------------- conversation memory
@@ -120,14 +135,15 @@ def clarify_node(state: AgentState) -> dict:
     llm = get_llm(state.get("backend"), temperature=0.2, role="lead", max_tokens=2048, thinking=False)
     try:
         data = extract_json(llm.invoke(CLARIFY_PROMPT.format(
-            query=query, date=_today(), prior=_prior_block(state, PRIOR_FOR_CLARIFY, 1500, 700))).content)
+            query=query, date=_today(), prior=_prior_block(state, PRIOR_FOR_CLARIFY, 1500, 700),
+            memory=_memory(state))).content)
     except Exception as exc:
-        emit(f"[yellow]  ! clarify failed ({truncate(str(exc), 100)}) — using your request as the brief[/]")
+        note(f"Couldn't analyse the request ({truncate(str(exc), 100)}); using it as the brief", "warn")
         data = {}
     follow_up = bool(prior.get("findings")) and _as_bool(data.get("follow_up"), False)
     if follow_up:
-        emit(f"[dim]· following up on: {truncate(prior.get('query', ''), 70)} "
-             f"({len(prior.get('sources') or {})} sources carried over)[/]")
+        note(f"Building on your last question: \"{truncate(prior.get('query', ''), 70)}\" "
+             f"({len(prior.get('sources') or {})} sources carried over)")
 
     questions: list[dict] = []
     for q in (data.get("questions") or [])[:3]:
@@ -141,6 +157,7 @@ def clarify_node(state: AgentState) -> dict:
 
     return {
         "run_id": f"{datetime.now():%Y%m%d-%H%M%S}-{_slug(query, 40)}",
+        "title": short_title(str(data.get("title") or "").strip(), 40),
         "intent": data.get("intent") or "find_papers",
         "brief": data.get("brief") or f"Research the user's request: {query}",
         "current_query": data.get("query") or query,
@@ -215,6 +232,7 @@ def normalize_spec(s: dict, backend: str | None, fallback_objective: str = "") -
     except (TypeError, ValueError):
         budget = default_budget(backend)
     return {
+        "title": short_title(str(s.get("title") or "").strip() or objective),
         "objective": objective,
         "key_questions": [str(q).strip() for q in kq if str(q).strip()][:3] or [objective],
         "sub_query": str(s.get("sub_query") or objective).strip(),
@@ -234,10 +252,10 @@ def plan_node(state: AgentState) -> dict:
     try:
         data = extract_json(llm.invoke(PLAN_PROMPT.format(
             query=state.get("query", ""), brief=state.get("brief", ""),
-            prior=_prior_block(state, PRIOR_FOR_PLAN, 2500, 900),
+            prior=_prior_block(state, PRIOR_FOR_PLAN, 2500, 900), memory=_memory(state),
             max_subagents=ceiling, date=_today())).content)
     except Exception as exc:
-        emit(f"[yellow]  ! planning failed ({truncate(str(exc), 100)}) — using one subagent[/]")
+        note(f"Planning failed ({truncate(str(exc), 100)}); using one research agent", "warn")
         data = {}
 
     plan = [p for p in (normalize_spec(s, backend) for s in (data.get("subagents") or [])) if p][:ceiling]
@@ -256,6 +274,7 @@ def merge_specs(plan: list[dict], brief: str) -> dict:
     kind, with the largest budget allowed — so "several subagents vs one" is a fair test."""
     kq = list(dict.fromkeys(q for s in plan for q in s["key_questions"]))
     return {
+        "title": "Whole research brief",
         "objective": brief,
         "key_questions": kq[:8],
         "sub_query": plan[0]["sub_query"],
@@ -329,10 +348,10 @@ def dispatch(specs: list[dict], state: AgentState, start_idx: int = 1) -> tuple[
     total = start_idx - 1 + len(specs)
     pending = [(i, s) for i, s in enumerate(specs, start_idx) if i not in done]
     parallel = backend == "deepseek" and settings.parallel_subagents and len(pending) > 1
-    if done:
-        emit(f"[dim]· reusing {len(done)} subagent(s) finished before the interruption[/]")
-    if pending:
-        emit(f"[dim]· dispatching {len(pending)} subagent(s) ({'parallel' if parallel else 'sequential'})[/]")
+    followup = start_idx > 1
+    before = len(state.get("sources") or {})
+    emit("wave_start", agents=[(i, s.get("title") or short_title(s.get("objective", ""))) for i, s in pending],
+         parallel=parallel, followup=followup, reused=len(done))
     limit = settings.wave_time_limit_min
     deadline = time.monotonic() + limit * 60 if limit and limit > 0 else None
     lock = threading.Lock()
@@ -353,9 +372,10 @@ def dispatch(specs: list[dict], state: AgentState, start_idx: int = 1) -> tuple[
         i, spec = item
         try:
             result = run_subagent(spec, backend, registry, i, total, state.get("brief", ""),
-                                  state.get("run_id", ""), deadline)
+                                  state.get("run_id", ""), deadline, memory=_memory(state))
         except Exception as exc:  # one broken subagent must not sink its siblings
-            emit(f"[yellow]  ! subagent [{i}/{total}] failed: {truncate(str(exc), 120)}[/]")
+            emit("agent_warn", idx=i, text=f"failed: {truncate(str(exc), 120)}")
+            emit("agent_done", idx=i, searches=0, reads=0, sources=0, failed=True)
             with lock:
                 failed[i] = _failed_report(spec, exc)  # not saved as done, so /resume retries it
             return
@@ -370,12 +390,16 @@ def dispatch(specs: list[dict], state: AgentState, start_idx: int = 1) -> tuple[
         for item in pending:
             go(item)
     reports = [done.get(i) or failed[i] for i in range(start_idx, start_idx + len(specs))]
+    sources = registry.to_dict()
+    emit("wave_done", agents=len(reports), followup=followup,
+         searches=sum(r.get("searches", 0) for r in reports), reads=sum(r.get("reads", 0) for r in reports),
+         sources=len(sources), new_sources=max(0, len(sources) - before))
     if path and not failed:
         try:
             path.unlink(missing_ok=True)  # the graph checkpoint now holds the results
         except Exception:
             pass
-    return reports, registry.to_dict()
+    return reports, sources
 
 
 def fanout_node(state: AgentState) -> dict:
@@ -414,8 +438,7 @@ def review_node(state: AgentState) -> dict:
     specs = [p for p in (normalize_spec(s, backend) for s in raw) if p]
     specs = specs[: settings.max_followup_subagents]
     if specs:
-        emit(f"[dim]· lead found gaps → {len(specs)} follow-up subagent(s): "
-             f"{'; '.join(truncate(s['objective'], 50) for s in specs)}[/]")
+        emit("gaps", titles=[s["title"] for s in specs])
     return {"followups": specs, "gaps": gaps}
 
 
@@ -458,7 +481,7 @@ def report_node(state: AgentState) -> dict:
         prior = _prior_block(state, PRIOR_FOR_REPORT, prior_chars, prior_chars)
         return REPORT_PROMPT.format(
             date=_today(), query=state.get("query", ""), brief=state.get("brief", ""), prior=prior,
-            briefings=_briefings(reports, limit), catalog=_catalog(state, cap))
+            memory=_memory(state), briefings=_briefings(reports, limit), catalog=_catalog(state, cap))
 
     if backend == "deepseek":
         levels = [(80, 3000, 3000)]
@@ -476,7 +499,7 @@ def report_node(state: AgentState) -> dict:
             error = str(exc)
         if report:
             break
-        emit("[yellow]  ! report came back empty — retrying without extended thinking[/]")
+        note("The report came back empty; retrying without extended thinking", "warn")
     if not report:
         report = (f"# Research findings\n\n(report writing failed: {error or 'empty response'})\n\n"
                   + _briefings(state.get("subagent_reports", [])))

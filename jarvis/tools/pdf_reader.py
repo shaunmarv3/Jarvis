@@ -23,7 +23,7 @@ _COMBINE_PROMPT = (
     "Combine these section summaries of the paper '{title}' into a clear briefing "
     "for a researcher. Use this structure:\n"
     "**Problem** · **Approach/Method** · **Key Results** · **Why it matters** · "
-    "**Limitations / open questions**.\n\n"
+    "**Limitations / open questions**.\n{memory}\n"
     "SECTION SUMMARIES:\n{parts}\n\nBRIEFING:"
 )
 
@@ -58,8 +58,10 @@ def _ensure_pdf(paper: dict) -> str | None:
         return None
 
 
-def summarize_paper(paper: dict, backend: str | None = None, max_chunks: int = 8) -> dict:
-    """Download (if needed), parse, and map-reduce summarize a paper."""
+def summarize_paper(paper: dict, backend: str | None = None, max_chunks: int = 8, memory: str = "") -> dict:
+    """Download (if needed), parse, and map-reduce summarize a paper.
+
+    `memory` (the user's standing preferences, as a prompt section) shapes the final briefing."""
     title = paper.get("title", "(untitled)")
     path = _ensure_pdf(paper)
     if not path:
@@ -90,19 +92,19 @@ def summarize_paper(paper: dict, backend: str | None = None, max_chunks: int = 8
         except Exception as exc:
             parts.append(f"(chunk summary failed: {exc})")
 
-    if len(parts) == 1:
+    if len(parts) == 1 and not memory:
         briefing = parts[0]
     else:
         # 8 section summaries can outgrow a local model's window; share it out evenly
         # instead of letting the server cut the prompt (which would drop the instructions).
         budget = input_char_budget(backend, 1500)
         if budget is not None:
-            room = budget - len(_COMBINE_PROMPT) - len(title)
+            room = budget - len(_COMBINE_PROMPT) - len(title) - len(memory)
             share = max(300, room // len(parts) - 2)
             parts = [truncate(p, share) for p in parts]
         try:
             briefing = llm.invoke(
-                _COMBINE_PROMPT.format(title=title, parts="\n\n".join(parts))
+                _COMBINE_PROMPT.format(title=title, parts="\n\n".join(parts), memory=memory)
             ).content
         except Exception as exc:
             briefing = "\n\n".join(parts) + f"\n\n(combine step failed: {exc})"

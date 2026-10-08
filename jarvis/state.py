@@ -11,7 +11,9 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
     run_id: str  # folder under data/runs/ holding this run's artifacts
     query: str  # the user's original request
+    title: str  # 2-5 word topic name from clarify (the terminal tab title)
     backend: str  # "ollama" | "deepseek"
+    memory: str  # the user's standing preferences (data/memory.md), set by the CLI only
     intent: str  # find_papers | pull_exact | read | find_datasets | general
     brief: str  # short research brief (confirmed by the user)
     clarify_questions: list  # lead's clarifying questions: [{question, options}] (may be empty)

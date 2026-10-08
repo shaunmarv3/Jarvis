@@ -12,7 +12,7 @@ If the answer isn't in the excerpts, say so plainly.
 
 EXCERPTS:
 {context}
-
+{memory}
 QUESTION: {question}
 
 ANSWER (cite which excerpt supports each claim where possible):"""
@@ -38,14 +38,16 @@ def ensure_indexed(paper: dict) -> tuple[bool, str, str]:
     return bool(folder), f"indexed {n} chunks", folder
 
 
-def ask_folder(question: str, folder: str, backend: str | None = None, k: int = 5):
-    """Answer a question scoped to a single paper's store (by folder)."""
+def ask_folder(question: str, folder: str, backend: str | None = None, k: int = 5, memory: str = ""):
+    """Answer a question scoped to a single paper's store (by folder).
+
+    `memory` is the user's standing preferences, already formatted as a prompt section."""
     docs = search(question, folder, k=k)
     if not docs:
         return "No relevant content found in that paper.", []
     context = "\n\n---\n\n".join(f"[{i + 1}] {d.page_content}" for i, d in enumerate(docs))
     llm = get_llm(backend, temperature=0.2, max_tokens=1200)
-    answer = llm.invoke(_QA_PROMPT.format(context=context, question=question)).content
+    answer = llm.invoke(_QA_PROMPT.format(context=context, question=question, memory=memory)).content
     return answer, docs
 
 

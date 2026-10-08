@@ -22,7 +22,7 @@ REAL_CHECK_OLLAMA = _llm.check_ollama
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
     """Point every data dir at a temp folder and disable the HTTP cache."""
-    for name in ("CACHE_DIR", "REPORTS_DIR", "RUNS_DIR", "PAPERS_DIR"):
+    for name in ("CACHE_DIR", "REPORTS_DIR", "RUNS_DIR", "PAPERS_DIR", "DATA_DIR"):  # DATA_DIR: memory.md
         d = tmp_path / name.lower()
         d.mkdir()
         monkeypatch.setattr(config, name, d)

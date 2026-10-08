@@ -51,6 +51,13 @@ and its open-sourced [lead / subagent prompts](https://github.com/anthropics/cla
 - **Follow-up questions** — ask "now compare that with X" after a report: the lead resolves what
   "that" means, plans only what's new, and can cite the previous report's sources. `/new` starts
   a fresh topic.
+- **It remembers your preferences** — `/remember prefer papers from 2023 onwards` saves a note to
+  your own `data/memory.md` (like Claude Code's memory file). The planner, every subagent, the
+  report writer, `/ask` and `/read` keep it in mind. `/memory` shows and edits it.
+- **Progress anyone can read** — one live line per research agent saying what it is doing in
+  plain words ("Searching arXiv: …", "Reading: <paper title>"), collapsed into a short summary
+  when the agents finish. The terminal tab shows `✦ <topic>` and spins while Jarvis works.
+  `/verbose` lists every tool call instead.
 - **Robust tools** — every API call goes through one layer with per-host rate limiting, retry with
   backoff on 429/5xx, and an on-disk cache. A hung tool is abandoned after 90 s, and each wave of
   subagents has a time limit, after which they write up what they have.
@@ -64,7 +71,7 @@ and its open-sourced [lead / subagent prompts](https://github.com/anthropics/cla
   tool runs.
 - **Chat with a paper** — `/read N` summarizes a paper and indexes it in its own vector store;
   `/ask` answers from that paper only.
-- **Measured** — 92 offline tests + CI, and an eval harness with 28 benchmark queries, repeated
+- **Measured** — 108 offline tests + CI, and an eval harness with 28 benchmark queries, repeated
   runs, known-answer fact checks, ablations, a simple baseline, a cross-family judge and a
   human-agreement check.
 
@@ -123,22 +130,62 @@ nothing carries over. `/new` drops the context explicitly.
 
 ## Quick start
 
+You need **Python 3.12+** and either a DeepSeek API key or [Ollama](https://ollama.com).
+
+**Windows (PowerShell)**
+
+```powershell
+git clone https://github.com/shaunmarv3/Jarvis.git jarvis
+cd jarvis
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install -e .
+copy .env.example .env          # then open .env and add your keys
+.\jarvis.bat                    # start Jarvis
+```
+
+**macOS / Linux**
+
 ```bash
 git clone https://github.com/shaunmarv3/Jarvis.git jarvis && cd jarvis
-python -m venv .venv
-.venv\Scripts\activate          # Windows   (macOS/Linux: source .venv/bin/activate)
-pip install -r requirements.txt
-pip install -e .                 # registers the `jarvis` command
-cp .env.example .env             # then edit .env
-jarvis                           # or: python -m jarvis
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e .
+cp .env.example .env            # then open .env and add your keys
+.venv/bin/jarvis                # start Jarvis
 ```
+
+Then pick a brain:
 
 - **DeepSeek (recommended for quality):** put your key in `.env` → `DEEPSEEK_API_KEY=sk-...`
   and set `DEFAULT_BACKEND=deepseek` (or switch at runtime with `/backend deepseek`).
 - **Local:** install [Ollama](https://ollama.com) and `ollama pull qwen3.5:9b` (plus
   `ollama pull nomic-embed-text` for `/ask`).
 
-On Windows you can also put the project folder on `PATH` and run `jarvis.bat` from any terminal.
+### Run `jarvis` from any folder
+
+`pip install -e .` creates a `jarvis` command inside `.venv`, but your terminal only finds it
+while that venv is activated. To type just `jarvis` anywhere, put a launcher on your `PATH` once:
+
+- **Windows:** `jarvis.bat` (in the project folder) starts Jarvis with the project's venv and
+  UTF-8 output. Add the project folder to your user `PATH`: run this **from the project folder**
+  in PowerShell, then open a new terminal:
+
+  ```powershell
+  [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$PWD", "User")
+  ```
+
+  (Or: Start → "Edit environment variables for your account" → `Path` → New → the project folder.)
+  Don't add `.venv\Scripts` itself: that would put the venv's `python` and `pip` ahead of your
+  system ones.
+- **macOS / Linux:** link the venv's command into a folder that is already on your `PATH`:
+
+  ```bash
+  mkdir -p ~/.local/bin && ln -s "$PWD/.venv/bin/jarvis" ~/.local/bin/jarvis
+  ```
+
+Check with `where jarvis` (Windows) or `which jarvis`. Jarvis always reads `.env` and `data/`
+from the project folder, whichever folder you start it from.
 
 ### Models & cost (DeepSeek)
 
@@ -162,26 +209,34 @@ A deep run is typically **$0.07–0.12** (see the eval table) — a $5 balance i
 ## Usage
 
 ```text
-> how are RAG systems evaluated in research and in production?
+jarvis ❯ how are RAG systems evaluated in research and in production?
 
-  research brief (breadth_first)
-  Plan — 3 subagent(s):
-    1. Academic RAG evaluation metrics & benchmarks       sources: academic, code · budget 8
-    2. How production teams evaluate & monitor RAG        sources: web, community · budget 7
-    3. Open-source evaluation frameworks compared         sources: code, web · budget 6
-  Proceed? [Y/edit/n] y
+✓ Understood the request
+✓ Planned 3 research agents
+╭─ research brief (breadth_first) ──────────────────────────────────────────╮
+│ Plan — 3 research agents:                                                  │
+│   1. RAG evaluation metrics & benchmarks                                   │
+│      looks in: academic, code · up to 8 searches                           │
+│   2. How production teams monitor RAG                                      │
+│      looks in: web, community · up to 7 searches                           │
+│   3. Open-source eval frameworks compared                                  │
+│      looks in: code, web · up to 6 searches                                │
+╰────────────────────────────────────────────────────────────────────────────╯
+Proceed? Y = go · type to refine the brief & re-plan · n = cancel (y): y
 
-  · dispatching 3 subagent(s) (parallel)
-  → subagent [1/3] Academic RAG evaluation metrics & benchmarks · budget 8
-      [1/3] search_arxiv(query=RAG evaluation metrics)
-      [1/3] search_semantic_scholar(query=RAG evaluation benchmark)
-      [2/3] search_web(query=RAG evaluation in production)
-      [1/3] read_paper(paper=S4, focus=faithfulness metric definition)
-  ↳ subagent [1/3] done · 8 searches + 3 reads · 30 sources
-  ⠋ lead reviewing findings for gaps… 4m 12s · $0.061 so far        ← live spinner
-  · lead found gaps → 1 follow-up subagent(s): RAGChecker primary source & metrics
-  · lead wrote the report
-  · citations attached
+⠹ Researching · 3 agents in parallel · 1 done          1m 42s · $0.031 · ctrl+c to pause
+  ✓ RAG evaluation metrics & benchmarks   done · 30 sources          8 searches · 3 reads
+  ⠹ How production teams monitor RAG      Searching Hacker News: "RAG evals in prod…"   5 searches
+  ⠹ Open-source eval frameworks compared  Reading: Ragas: Automated Evaluation of R…   4 searches · 1 read
+                                                      ↑ live: these lines update in place
+✓ Researched with 3 agents · 21 searches · 6 reads · 95 sources (4m 12s)
+    ✓ RAG evaluation metrics & benchmarks · 30 sources
+    ✓ How production teams monitor RAG · 33 sources
+    ✓ Open-source eval frameworks compared · 32 sources
+● Found a gap → 1 more agent: RAGChecker metrics
+✓ Followed up with 1 agent · 6 searches · 3 reads · +13 new sources (1m 05s)
+✓ Wrote the report
+✓ Linked 43 citations (150 sources retrieved)
 
   ╭─ report ─────────────────────────────────────────────────╮
   │ # How RAG systems are evaluated …  [1][2] … ## Sources   │
@@ -196,6 +251,9 @@ A deep run is typically **$0.07–0.12** (see the eval table) — a $5 balance i
   └───────────────────────────────────────────────────────────────┘
 ```
 
+`/verbose` switches back to one line per tool call (`[2] Searching arXiv: "RAG evaluation"`), and
+every subagent's full transcript is saved under `data/runs/<run id>/`.
+
 | Command                                       | Action                                                            |
 | --------------------------------------------- | ----------------------------------------------------------------- |
 | `<free text>`                                 | research anything — clarify → plan → confirm → research → report  |
@@ -204,10 +262,41 @@ A deep run is typically **$0.07–0.12** (see the eval table) — a $5 balance i
 | `/db` · `/use <N>` · `/forget <N>`            | manage the paper vector library                                   |
 | `/save <N>`                                   | download paper N's PDF                                            |
 | `/new`                                        | start a fresh topic (the next question won't build on the last report) |
+| `/remember <note>`                            | save a preference every agent keeps in mind (see **Memory** below) |
+| `/memory` · `/memory edit` · `/memory remove <N>` · `/memory clear` | show / edit your memory file |
+| `/verbose [on\|off]`                          | list every tool call during research instead of one line per agent |
 | `/resume`                                     | continue the last run after a crash / Ctrl+C (finished subagents are reused) |
 | `/cost`                                       | token usage & estimated cost of the last run                      |
 | `/dataset <q>` · `/inspect <id>` · `/web <q>` | quick one-off lookups                                             |
 | `/backend ollama\|deepseek` · `/model <name>` | switch brains                                                     |
+
+### Memory
+
+Notes you want Jarvis to always know live in `data/memory.md`: a plain markdown file, one
+`- ` line per note.
+
+```text
+jarvis ❯ /remember I'm new to ML: explain jargon briefly and keep reports short
+remembered I'm new to ML: explain jargon briefly and keep reports short · note #1
+jarvis ❯ /remember prefer papers from 2023 onwards; skip Medium posts
+jarvis ❯ /memory
+╭─ memory · every agent keeps these in mind ─╮
+│   1. I'm new to ML: explain jargon briefly…  │
+│   2. prefer papers from 2023 onwards; skip…  │
+╰──────────────────────── 121 characters ─────╯
+```
+
+- **Who sees it:** the planner, every research subagent, the report writer, `/ask` and `/read`.
+  Notes are treated as preferences: if one conflicts with your current question, the question
+  wins, and notes are never cited as sources.
+- **Yours only:** `data/` is git-ignored, so every person who clones Jarvis has their own memory
+  file and it is never committed or pushed.
+- **Edit it any way you like:** `/memory edit` opens it (in `$EDITOR`, else Notepad / nano), or
+  open the file yourself. It is read fresh for every question, so changes apply right away.
+- **Size:** the first 2,000 characters reach the agents on DeepSeek, 800 on Ollama (its context
+  window is small). `/memory` warns you when your notes are longer.
+- **Not in evals:** only the interactive CLI reads it; headless runs and the eval harness never
+  do, so scores aren't shaped by one person's preferences.
 
 ## Evals
 
@@ -260,7 +349,7 @@ Weakest criterion so far: **source quality** (vendor/SEO blogs still get cited).
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 92 tests, no network, no LLM (fake models + fake tools)
+pytest -q          # 108 tests, no network, no LLM (fake models + fake tools)
 python scripts/smoke.py deepseek "your question"   # one real end-to-end run
 python scripts/smoke.py ollama "q" --follow-up "compare that with X"   # also exercises memory
 ```
@@ -271,7 +360,9 @@ registry & deterministic citations, plan validation, the follow-up wave and the 
 per-subagent resume after a crash, follow-up questions, the full graph end-to-end, backend health
 checks, HTTP retry/cache/rate-limit (GET and POST), PDF validation, vector-registry recovery,
 every tool's offline behavior, DeepSeek thinking-mode payloads, cost accounting and its restore,
-and the eval tooling (fact recall, statistics, human agreement, baseline, judges).
+the eval tooling (fact recall, statistics, human agreement, baseline, judges), the user memory
+file (and that it reaches every agent but no headless run), the live progress view, and the
+slash-command dropdown.
 
 ## Project structure
 
@@ -279,7 +370,10 @@ and the eval tooling (fact recall, statistics, human agreement, baseline, judges
 Jarvis/                          (repo root)
 ├── jarvis/                      the Python package
 │   ├── __main__.py              `python -m jarvis` entry point
-│   ├── cli.py                   Rich REPL: live progress, plan approval, report, run summary
+│   ├── cli.py                   Rich REPL: plan approval, report, run summary, /memory commands
+│   ├── progress.py              live progress view: one line per research agent, wave summaries
+│   ├── memory.py                the user's memory file (data/memory.md)
+│   ├── terminal.py              terminal tab title (✦ <topic>)
 │   ├── repl.py                  prompt_toolkit input + live /command dropdown
 │   ├── banner.py                JARVIS ASCII banner
 │   ├── config.py                settings: lead/worker models, prices, budgets, optional keys
@@ -290,7 +384,7 @@ Jarvis/                          (repo root)
 │   ├── subagent.py              the agentic tool loop for one delegated task
 │   ├── sources.py               source registry + deterministic citations
 │   ├── prompts.py               lead / subagent / review / report prompts (after Anthropic's cookbook)
-│   ├── events.py                progress sink (subagents stream live lines to the CLI)
+│   ├── events.py                structured progress events (nodes stay UI-free)
 │   ├── headless.py              run a research request without a human (smoke tests, evals)
 │   ├── store.py · qa.py · embeddings.py   per-paper vector stores & /ask Q&A
 │   ├── utils.py                 JSON extraction, chunking, truncation, atomic JSON writes
@@ -304,12 +398,12 @@ Jarvis/                          (repo root)
 │       ├── datasets.py · hf_models.py · hf_inspect.py   HuggingFace datasets & models
 │       ├── community.py         Hacker News (+ Reddit, currently blocked)
 │       └── pdf_reader.py        map-reduce paper summaries for /read
-├── tests/                       92 offline tests (fake LLM + fake tools)
+├── tests/                       108 offline tests (fake LLM + fake tools)
 ├── evals/                       queries.jsonl (28) · run_evals.py · judge.py · baseline.py · human.py · results/
 ├── scripts/                     smoke.py (real run, optional follow-up) · test_commands.py (CLI commands)
 ├── .github/workflows/ci.yml     pytest on push to main / PRs
 ├── requirements.txt · requirements-dev.txt · pyproject.toml
 ├── .env.example                 copy to .env and add keys
 ├── jarvis.bat                   run `jarvis` from any Windows terminal
-└── data/                        (git-ignored) papers, reports, runs/, vectorstore, cache, checkpoints
+└── data/                        (git-ignored) memory.md, papers, reports, runs/, vectorstore, cache, checkpoints
 ```

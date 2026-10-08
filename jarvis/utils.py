@@ -17,6 +17,14 @@ def write_json_atomic(path, data: Any, indent: int | None = 2) -> None:
     os.replace(tmp, path)
 
 
+def write_text_atomic(path, text: str) -> None:
+    """Text-file twin of write_json_atomic (newline="" keeps the line endings we wrote)."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def extract_json(text: str) -> dict[str, Any]:
     """Best-effort pull of a JSON object out of an LLM response.
 

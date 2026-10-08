@@ -118,6 +118,26 @@ def _fmt_call(name: str, args: dict) -> str:
     return f"{name}({', '.join(f'{k}={truncate(str(v), 40)}' for k, v in (args or {}).items())})"
 
 
+def _target(args: dict, registry: SourceRegistry) -> str:
+    """What a tool call is about, for people: the query, or the title behind a source id."""
+    args = args or {}
+    if args.get("query"):
+        return str(args["query"])
+    for key in ("paper", "url", "id_or_url"):
+        v = args.get(key)
+        if not isinstance(v, str) or not v.strip():
+            continue
+        m = _SID.match(v)
+        entry = registry.get(m.group(1).upper()) if m else None
+        if entry:
+            return entry["item"].get("title") or entry["item"].get("url") or v
+        return re.sub(r"^https?://(www\.)?", "", v.strip())
+    for key in ("hub_id", "title", "doi"):
+        if args.get(key):
+            return str(args[key])
+    return ""
+
+
 def _size(msgs: list) -> int:
     return sum(len(str(m.content)) for m in msgs)
 
@@ -204,16 +224,17 @@ def run_subagent(
     brief: str = "",
     run_id: str = "",
     deadline: float | None = None,
+    memory: str = "",
 ) -> dict:
     """Research one delegated task end-to-end. Returns a structured report dict.
 
     `deadline` (a time.monotonic() value) is the wave's time limit: once it passes, the
     subagent stops researching and writes its report from what it already has.
+    `memory` is the user's standing preferences, already formatted as a prompt section.
     """
     objective = (spec.get("objective") or "").strip()
     budget = _clamp_budget(spec, backend)
     sources = [s for s in (spec.get("sources") or ["academic", "web"]) if s in _FALLBACK] or ["academic", "web"]
-    tag = f"[{idx}/{total}]"
     tools = TOOL_SCHEMAS + [complete_task]
     window = input_char_budget(backend)  # None on DeepSeek (window far larger than 8 turns)
     ctx_limit = 400_000 if window is None else max(4000, window - _tools_overhead(tools))
@@ -231,6 +252,7 @@ def run_subagent(
             output_format=spec.get("output_format") or "concrete findings with [S#] citations",
             boundaries=spec.get("boundaries") or "(none stated)",
             brief=brief or objective,
+            memory=memory,
         )),
     ]
 
@@ -239,17 +261,17 @@ def run_subagent(
     called: list[str] = []
     seen: set[str] = set()
     report: str | None = None
-    emit(f"[dim]  → subagent {tag} [cyan]{truncate(objective, 70)}[/] · budget {budget}[/]")
+    emit("agent_start", idx=idx, total=total, title=spec.get("title") or truncate(objective, 44), budget=budget)
 
     for turn in range(settings.subagent_max_turns):
         if deadline and time.monotonic() >= deadline:
-            emit(f"[yellow]  ! subagent {tag} hit the wave time limit — writing its report now[/]")
+            emit("agent_warn", idx=idx, text="hit the wave time limit; writing its report now")
             break
         turns = turn + 1
         try:
             ai = llm.invoke(_compact(msgs, ctx_limit))
         except Exception as exc:
-            emit(f"[yellow]  ! subagent {tag} LLM error: {truncate(str(exc), 120)}[/]")
+            emit("agent_warn", idx=idx, text=f"model error: {truncate(str(exc), 120)}")
             break
         calls = list(getattr(ai, "tool_calls", None) or [])
 
@@ -260,12 +282,12 @@ def run_subagent(
                 texts = []
                 for s in sources:
                     for name in _FALLBACK[s][:1]:
+                        emit("agent_tool", idx=idx, tool=name, target=q)
                         text, sids = execute_tool(name, {"query": q}, registry)
                         used += 1
                         seen.update(sids)
                         called.append(_fmt_call(name, {"query": q}))
                         texts.append(text)
-                emit(f"[dim]    {tag} (model skipped tools — ran starter searches)[/]")
                 share = max(800, ctx_limit // (3 * max(1, len(texts))))  # compaction never trims this message
                 msgs.append(HumanMessage("Do not answer from memory. Starting search results:\n\n"
                                          + "\n\n".join(truncate(t, share) for t in texts)
@@ -284,7 +306,7 @@ def run_subagent(
         results = {}
         if allowed:
             for c in allowed:
-                emit(f"[dim]    {tag} {_fmt_call(c['name'], c.get('args'))}[/]")
+                emit("agent_tool", idx=idx, tool=c["name"], target=_target(c.get("args"), registry))
             results = _run_parallel(allowed, registry, deadline)
         used += len(searches_ok)
         reads += len(reads_ok)
@@ -324,19 +346,21 @@ def run_subagent(
             if not report and getattr(ai, "tool_calls", None):
                 report = str(ai.tool_calls[0].get("args", {}).get("report", "")).strip()
         except Exception as exc:
-            emit(f"[yellow]  ! subagent {tag} could not write report: {truncate(str(exc), 120)}[/]")
+            emit("agent_warn", idx=idx, text=f"couldn't write its report: {truncate(str(exc), 120)}")
         if not report:  # last resort: hand the lead the raw source list
             report = "Raw sources found (no written report):\n" + "\n".join(
                 render_item(s, registry.get(s)["kind"], registry.get(s)["item"]) for s in list(seen)[:12]
             )
 
-    emit(f"[dim]  ↳ subagent {tag} done · {used} searches + {reads} reads · {len(seen)} sources[/]")
+    emit("agent_done", idx=idx, searches=used, reads=reads, sources=len(seen))
     result = {
         "objective": objective,
         "findings": report,
         "sources": sorted(seen, key=lambda s: int(s[1:])),
         "tools": called,
         "tool_calls": used + reads,
+        "searches": used,
+        "reads": reads,
         "turns": turns,
     }
     _save_transcript(run_id, idx, spec, result)

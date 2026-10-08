@@ -116,7 +116,7 @@ def test_resume_reuses_finished_subagents_and_their_source_ids(tmp_path, monkeyp
     specs = [{"objective": "one"}, {"objective": "two"}, {"objective": "three"}]
     state = _state(tmp_path, monkeypatch)
 
-    def first_attempt(spec, backend, registry, i, total, brief, run_id, deadline):
+    def first_attempt(spec, backend, registry, i, total, brief, run_id, deadline, **kw):
         if i == 2:
             raise Crash()
         sid = registry.add("paper", fake_paper(i))
@@ -131,7 +131,7 @@ def test_resume_reuses_finished_subagents_and_their_source_ids(tmp_path, monkeyp
 
     ran = []
 
-    def second_attempt(spec, backend, registry, i, total, brief, run_id, deadline):
+    def second_attempt(spec, backend, registry, i, total, brief, run_id, deadline, **kw):
         ran.append(i)
         sid = registry.add("paper", fake_paper(10 + i))
         return {"objective": spec["objective"], "findings": f"found [{sid}]", "sources": [sid],
@@ -151,7 +151,7 @@ def test_saved_progress_is_ignored_for_a_different_plan(tmp_path, monkeypatch):
     (tmp_path / "run1" / "wave_1.json").write_text(json.dumps(
         {"objectives": ["old plan"], "registry": {}, "done": {"1": {"objective": "old plan"}}}), encoding="utf-8")
     ran = []
-    monkeypatch.setattr(nodes, "run_subagent", lambda spec, *a: ran.append(spec["objective"]) or {
+    monkeypatch.setattr(nodes, "run_subagent", lambda spec, *a, **k: ran.append(spec["objective"]) or {
         "objective": spec["objective"], "findings": "f", "sources": [], "tools": [], "tool_calls": 0, "turns": 1})
     nodes.dispatch([{"objective": "new plan"}], state)
     assert ran == ["new plan"]
@@ -160,7 +160,7 @@ def test_saved_progress_is_ignored_for_a_different_plan(tmp_path, monkeypatch):
 def test_one_failing_subagent_does_not_sink_the_wave(tmp_path, monkeypatch):
     state = _state(tmp_path, monkeypatch)
 
-    def flaky(spec, backend, registry, i, *a):
+    def flaky(spec, backend, registry, i, *a, **kw):
         if i == 1:
             raise RuntimeError("boom")
         return {"objective": spec["objective"], "findings": "ok", "sources": [], "tools": [], "tool_calls": 1,

@@ -22,6 +22,9 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("/papers", "", "list the last run's papers (cited first)"),
     ("/sources", "", "list every source the last run retrieved (papers, web, code, data, community)"),
     ("/new", "", "start a fresh topic (the next question won't build on the last report)"),
+    ("/remember", "<note>", "save a preference every agent will always keep in mind"),
+    ("/memory", "[edit|remove N|clear]", "show your saved preferences (data/memory.md), or change them"),
+    ("/verbose", "[on|off]", "list every tool call during research (default: one live line per agent)"),
     ("/resume", "", "resume the last research run if it was interrupted or crashed"),
     ("/cost", "", "token usage & estimated cost of the last run"),
     ("/dataset", "<query>", "quick HuggingFace dataset search"),
@@ -76,8 +79,21 @@ def _session_items() -> list[tuple[str, str]]:
         return []
 
 
+def _memory_items() -> list[tuple[str, str]]:
+    """(number, note) for each note in the user's memory file."""
+    try:
+        from .memory import notes
+
+        return [(str(i), n) for i, n in enumerate(notes(), 1)]
+    except Exception:
+        return []
+
+
 # Which commands complete their FIRST argument from a live list, and where from.
 _ARG_SOURCES = {
+    "/memory": lambda: [("edit", "open the file in your editor"), ("remove", "delete one note by number"),
+                        ("clear", "delete every note"), ("add", "add a note (same as /remember)")],
+    "/verbose": lambda: [("on", "list every tool call"), ("off", "one live line per agent")],
     "/use": _db_items,
     "/forget": _db_items,
     "/ask": _db_items,  # pick the paper number, then type the question
@@ -86,6 +102,8 @@ _ARG_SOURCES = {
     "/backend": lambda: [("ollama", "local · sequential subagents"),
                          ("deepseek", "cloud · parallel subagents")],
 }
+# Commands whose SECOND argument completes from a live list: (command, first arg) -> source.
+_SUBARG_SOURCES = {("/memory", "remove"): _memory_items}
 
 
 def _make_completer():
@@ -111,7 +129,12 @@ def _make_completer():
             cmd = text[:sp].lower()
             arg = text[sp + 1:]
             source = _ARG_SOURCES.get(cmd)
-            if source is None or " " in arg:  # only the first arg
+            if " " in arg:  # a second argument: only a few commands have a list for it
+                first, _, arg = arg.partition(" ")
+                source = _SUBARG_SOURCES.get((cmd, first.lower()))
+                if " " in arg:
+                    return
+            if source is None:
                 return
             items = source()
             if not items:

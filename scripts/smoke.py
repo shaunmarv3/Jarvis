@@ -16,6 +16,7 @@ from jarvis.events import set_sink
 from jarvis.headless import BackendUnavailable, run_research
 from jarvis.llm import usage
 from jarvis.nodes import build_prior
+from jarvis.progress import plain_line
 
 
 def _show(final: dict) -> str:
@@ -41,9 +42,11 @@ def main() -> int:
     ap.add_argument("query", nargs="?", default="how are RAG systems evaluated in research and in production?")
     ap.add_argument("--follow-up", default="", help="a second question that builds on the first report")
     args = ap.parse_args()
-    from rich.console import Console
+    def show_event(event: str, data: dict) -> None:
+        if (line := plain_line(event, data)) is not None:
+            print(line, flush=True)
 
-    set_sink(Console(highlight=False).print)
+    set_sink(show_event)
 
     try:
         final = run_research(args.query, args.backend)

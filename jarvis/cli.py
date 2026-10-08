@@ -9,32 +9,26 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
 from . import llm as _llm
+from . import memory, terminal
 from .banner import render_banner
 from .config import DATA_DIR, settings, subagent_ceiling
 from .graph import build_graph
 from .llm import active_backend, model_label, resolve_backend, set_active_backend, usage
 from .nodes import build_prior
+from .progress import ProgressView, fmt_secs
 from .repl import COMMANDS, read_line, set_session_papers_getter
 from .tools.pdf_reader import summarize_paper
 from .utils import truncate, write_json_atomic
 
 console = Console()
+_view = ProgressView(console)  # live progress for research runs; also the events sink
 
-_NODE_LABELS = {
-    "clarify": " understanding your request",
-    "brief": " refining the brief from your answers",
-    "plan": " lead agent planned the research",
-    "fanout": " subagents finished researching",
-    "review": " lead reviewed the findings",
-    "followup": " follow-up subagents finished",
-    "report": " lead wrote the report",
-    "cite": " citations attached",
-}
 _LAST_RUN = DATA_DIR / "last_run.json"
 _LAST_USAGE = DATA_DIR / "last_run_usage.json"  # token counts, saved after every LLM call
 
@@ -54,64 +48,23 @@ def _build_help() -> str:
 _HELP = _build_help()
 
 
-# What the agent is busy doing *after* each node returns (the next blocking stage),
-# so the live spinner always names what's actually running — never blank.
-_BUSY_AFTER = {
-    "clarify": "planning the research",
-    "brief": "planning the research",
-    "fanout": "lead reviewing findings for gaps",
-    "review": "lead writing the report",
-    "followup": "lead writing the report",
-    "report": "attaching citations",
-}
+def _drive(graph, payload, config, busy: str = "Working", t0: float | None = None):
+    """Stream the graph behind the live progress view. Returns ('interrupt', value) or ('done', None).
 
-
-def _fmt_secs(s: float) -> str:
-    s = int(s)
-    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
-
-
-def _drive(graph, payload, config, busy: str = "working"):
-    """Stream the graph behind a live spinner. Returns ('interrupt', value) or ('done', None).
-
-    The spinner names the stage that's running and ticks every second with elapsed
-    time and the cost so far, so a long research run never looks frozen.
+    The view names the stage that's running, shows one live line per research agent, and
+    ticks with the run's elapsed time (from `t0`) and the cost so far, so a long research
+    run never looks frozen.
     """
-    import threading
-    import time
-
-    t0 = time.time()
-    stage = [busy]
-    stop = threading.Event()
     backend = active_backend()
-
-    with console.status(f"[cyan]{busy}…[/]", spinner="dots") as status:
-
-        def tick():
-            while not stop.wait(1.0):
-                cost = usage.cost(backend)
-                money = f" · ${cost:.3f} so far" if backend == "deepseek" else ""
-                status.update(f"[cyan]{stage[0]}…[/] [dim]{_fmt_secs(time.time() - t0)}{money}[/]")
-
-        ticker = threading.Thread(target=tick, daemon=True)
-        ticker.start()
-        try:
-            for chunk in graph.stream(payload, config, stream_mode="updates"):
-                if "__interrupt__" in chunk:
-                    intr = chunk["__interrupt__"]
-                    value = intr[0].value if isinstance(intr, (list, tuple)) else intr
-                    return ("interrupt", value)
-                for node, update in chunk.items():
-                    label = _NODE_LABELS.get(node)
-                    if label:
-                        console.print(f"[dim]· {label}[/]")
-                    if node in ("fanout", "followup") and isinstance(update, dict):
-                        console.print(f"[dim]  ↳ {len(update.get('sources', {}) or {})} unique sources so far[/]")
-                    nxt = _BUSY_AFTER.get(node)
-                    if nxt:
-                        stage[0] = nxt
-        finally:
-            stop.set()
+    cost = (lambda: f"${usage.cost(backend):.3f}") if backend == "deepseek" else None
+    with _view.running(busy, cost, t0):
+        for chunk in graph.stream(payload, config, stream_mode="updates"):
+            if "__interrupt__" in chunk:
+                intr = chunk["__interrupt__"]
+                value = intr[0].value if isinstance(intr, (list, tuple)) else intr
+                return ("interrupt", value)
+            for node, update in chunk.items():
+                _view.node_done(node, update)
     return ("done", None)
 
 
@@ -136,7 +89,7 @@ def _run_summary(final: dict, backend: str, seconds: float | None) -> None:
     else:
         table.add_row("cost", "[bold green]$0.00[/] [dim](local Ollama)[/]")
     if seconds is not None:
-        table.add_row("time", _fmt_secs(seconds))
+        table.add_row("time", fmt_secs(seconds))
     table.add_row("research", f"{len(reports)} subagents · {calls} tool calls"
                   + (f" · {final.get('query_type')}" if final.get("query_type") else ""))
     if stats:
@@ -178,23 +131,30 @@ def _plan_panel(value: dict) -> None:
     qtype = value.get("query_type") or value.get("intent", "")
     body = value.get("brief", "")
     if plan:
-        rows = [
-            f"  [cyan]{i}.[/] {sub.get('objective', '')}\n"
-            f"     [dim]sources: {', '.join(sub.get('sources', []))} · budget {sub.get('tool_budget', '?')} tool calls[/]"
-            for i, sub in enumerate(plan, 1)
-        ]
-        body += f"\n\n[bold]Plan — {len(plan)} subagent(s):[/]\n" + "\n".join(rows)
+        rows = []
+        for i, sub in enumerate(plan, 1):
+            objective = sub.get("objective", "")
+            title = sub.get("title") or objective
+            rows.append(
+                f"  [cyan]{i}.[/] [bold]{escape(title)}[/]\n"
+                + (f"     {escape(objective)}\n" if objective and objective != title else "")
+                + f"     [dim]looks in: {', '.join(sub.get('sources', []))} · "
+                  f"up to {sub.get('tool_budget', '?')} searches[/]"
+            )
+        agents = f"{len(plan)} research agent{'s' if len(plan) != 1 else ''}"
+        body += f"\n\n[bold]Plan — {agents}:[/]\n" + "\n".join(rows)
     console.print(Panel(body, title=f"[bold]research brief[/] [dim]({qtype})[/]", border_style="yellow"))
 
 
-def _drive_until_done(graph, payload, config, busy: str) -> bool:
+def _drive_until_done(graph, payload, config, busy: str, t0: float | None = None) -> bool:
     """Drive the graph through its human-in-the-loop interrupts. False if cancelled."""
-    status, value = _drive(graph, payload, config, busy=busy)
+    status, value = _drive(graph, payload, config, busy=busy, t0=t0)
     while status == "interrupt":
         itype = value.get("type") if isinstance(value, dict) else None
         if itype == "clarify_questions":
             answers = _ask_clarifying(value.get("questions", []))
-            status, value = _drive(graph, Command(resume={"answers": answers}), config, busy="drafting the brief")
+            status, value = _drive(graph, Command(resume={"answers": answers}), config,
+                                   busy="Refining the brief", t0=t0)
             continue
         _plan_panel(value if isinstance(value, dict) else {"brief": str(value)})
         ans = Prompt.ask(
@@ -204,7 +164,9 @@ def _drive_until_done(graph, payload, config, busy: str) -> bool:
         if ans.strip().lower() in {"n", "no", "q", "quit", "cancel"}:
             console.print("[red]cancelled[/]")
             return False
-        status, value = _drive(graph, Command(resume=ans), config, busy="subagents researching")
+        go = ans.strip().lower() in {"", "y", "yes", "go", "ok", "okay", "proceed", "sure"}
+        status, value = _drive(graph, Command(resume=ans), config,
+                               busy="Starting the research agents" if go else "Re-planning", t0=t0)
     return True
 
 
@@ -245,8 +207,11 @@ def _run_query(graph, query: str, prior: dict | None = None) -> dict | None:
     usage.reset()
     usage.attach(_LAST_USAGE, thread_id)  # so /resume after a crash still knows what was spent
     t0 = time.time()
-    init = {"messages": [HumanMessage(content=query)], "query": query, "backend": backend, "prior": prior or {}}
-    if not _drive_until_done(graph, init, config, busy="understanding your request"):
+    _view.topic = query  # the tab shows the request until clarify names the topic
+    # The memory file is read fresh for every question, so hand edits apply right away.
+    init = {"messages": [HumanMessage(content=query)], "query": query, "backend": backend,
+            "prior": prior or {}, "memory": memory.text()}
+    if not _drive_until_done(graph, init, config, busy="Understanding your request", t0=t0):
         return None
     return _show_report(graph, config, backend, time.time() - t0)
 
@@ -286,7 +251,8 @@ def _resume(graph) -> dict | None:
                   + ("" if restored else " [dim](earlier token usage unknown)[/]"))
     set_active_backend(backend)
     t0 = time.time()
-    if not _drive_until_done(graph, None, config, busy="resuming"):
+    _view.topic = snap.values.get("title") or last.get("query", "")
+    if not _drive_until_done(graph, None, config, busy="Resuming", t0=t0):
         return None
     return _show_report(graph, config, backend, time.time() - t0)
 
@@ -339,7 +305,7 @@ def _read_paper(papers: list[dict], idx: int) -> tuple[dict, str] | None:
         return None
     console.print(f"[dim]reading: {paper.get('title')} …[/]")
     with console.status("[cyan]downloading & summarizing…[/]"):
-        out = summarize_paper(paper, backend=active_backend())
+        out = summarize_paper(paper, backend=active_backend(), memory=_memory_prompt())
     console.print(Panel(Markdown(out["text"]), border_style="blue"))
 
     # Persist summary + index full text into a dedicated vector folder.
@@ -414,7 +380,7 @@ def _ask(folder: str | None, question: str) -> str | None:
         console.print(f"[red]can't answer:[/] {problem}")
         return None
     with console.status("[cyan]thinking…[/]"):
-        answer, docs = ask_folder(question, folder, backend=active_backend())
+        answer, docs = ask_folder(question, folder, backend=active_backend(), memory=_memory_prompt())
     console.print(Panel(Markdown(answer), title=f"[bold]Q&A · {truncate(title, 50)}[/]", border_style="magenta"))
     return folder
 
@@ -455,6 +421,93 @@ def _web_cmd(query: str) -> None:
     console.print(Panel(out["text"], title="[bold]web[/]", border_style="cyan"))
 
 
+def _memory_prompt() -> str:
+    """The memory file as a prompt section for one-shot calls (/ask, /read)."""
+    return memory.prompt_block(memory.text(), active_backend())
+
+
+def _show_memory() -> None:
+    notes = memory.notes()
+    body = memory.text()
+    if not body:
+        console.print("[dim]your memory is empty — [green]/remember <note>[/] adds a preference every agent "
+                      "will keep in mind (e.g. /remember prefer papers from 2023 onwards)[/]")
+        return
+    rows = [f"  [cyan]{i}.[/] {escape(n)}" for i, n in enumerate(notes, 1)]
+    other = [ln for ln in body.splitlines() if ln.strip() and not ln.lstrip().startswith(("-", "*"))]
+    if other:  # free text written by hand in the file
+        rows += [""] + [f"  [dim]{escape(ln)}[/]" for ln in other]
+    backend = resolve_backend()[0]
+    cap = memory.limit(backend)
+    foot = f"{len(body)} characters · {escape(str(memory.path()))}"
+    if len(body) > cap:
+        foot += f"\n[yellow]only the first {cap} characters reach the agents on {backend} — trim it to fit[/]"
+    console.print(Panel("\n".join(rows) or "[dim](no notes)[/]", title="[bold]memory[/] [dim]· every agent keeps "
+                        "these in mind[/]", subtitle=f"[dim]{foot}[/]", border_style="magenta", expand=False))
+    console.print("[dim]/remember <note> · /memory remove <N> · /memory edit · /memory clear[/]")
+
+
+def _edit_memory() -> None:
+    """Open the memory file in the user's editor ($EDITOR, else Notepad / nano)."""
+    import os
+    import shlex
+    import subprocess
+    import sys
+
+    memory.ensure()
+    path = str(memory.path())
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+    try:
+        if editor:  # terminal editors (vim, nano, code --wait) need us to wait for them
+            subprocess.run([*shlex.split(editor, posix=sys.platform != "win32"), path], check=False)
+            console.print(f"[green]memory saved[/] [dim]· {len(memory.notes())} notes[/]")
+            return
+        subprocess.Popen(["notepad", path] if sys.platform == "win32" else ["nano", path])
+        console.print(f"[green]opened[/] {escape(path)} [dim]· save it and your next question uses it[/]")
+    except Exception as exc:
+        console.print(f"[yellow]couldn't open an editor ({exc}) — edit this file directly:[/] {escape(path)}")
+
+
+def _memory_cmd(arg: str) -> None:
+    sub, _, rest = arg.strip().partition(" ")
+    sub, rest = sub.lower(), rest.strip()
+    if sub in {"", "show", "list"}:
+        _show_memory()
+    elif sub == "add":
+        _remember(rest)
+    elif sub in {"remove", "rm", "delete"}:
+        if not rest.isdigit():
+            console.print("[red]usage: /memory remove <N>[/] [dim](see the numbers with /memory)[/]")
+            return
+        removed = memory.remove(int(rest))
+        if removed is None:
+            console.print(f"[red]no note #{rest}[/] (have {len(memory.notes())})")
+        else:
+            console.print(f"[green]forgot[/] {escape(removed)}")
+    elif sub == "edit":
+        _edit_memory()
+    elif sub == "clear":
+        n = len(memory.notes())
+        if not memory.text():
+            console.print("[dim]memory is already empty[/]")
+        elif Prompt.ask(f"[bold]Delete all {n} notes?[/] [dim]y/N[/]", default="n").strip().lower() in {"y", "yes"}:
+            memory.clear()
+            console.print("[green]memory cleared[/]")
+        else:
+            console.print("[dim]kept your notes[/]")
+    else:
+        console.print("[red]usage: /memory \\[edit | remove <N> | clear][/] [dim]· /remember <note> adds one[/]")
+
+
+def _remember(text: str) -> None:
+    if not text.strip():
+        console.print("[red]usage: /remember <note>[/] [dim]e.g. /remember I use PyTorch, show PyTorch code[/]")
+        return
+    note = memory.add(text)
+    console.print(f"[green]remembered[/] {escape(note)} [dim]· note #{len(memory.notes())} · "
+                  "every agent will keep it in mind[/]")
+
+
 def _save_paper(papers: list[dict], idx: int) -> None:
     if not (1 <= idx <= len(papers)):
         console.print(f"[red]no paper #{idx}[/]")
@@ -481,8 +534,15 @@ def main() -> None:
     # Let deep nodes (subagent fan-out) stream live progress to this console.
     from .events import set_sink
 
-    set_sink(lambda m: console.print(m))
+    set_sink(_view.handle)
+    terminal.set_title(terminal.title_text())
+    try:
+        _repl()
+    finally:
+        terminal.restore_title()
 
+
+def _repl() -> None:
     set_active_backend(settings.default_backend)
     try:
         console.clear()
@@ -492,6 +552,8 @@ def main() -> None:
         console.print("[bold cyan]J A R V I S[/] — personal research agent")
     if resolve_backend()[0] == "deepseek":
         console.print(f"[dim]lead: {settings.deepseek_lead_model} · subagents: {settings.deepseek_worker_model}[/]")
+    if n_notes := len(memory.notes()):
+        console.print(f"[dim]remembering {n_notes} note{'s' if n_notes != 1 else ''} about you · /memory[/]")
 
     graph = build_graph()
     session_papers: list[dict] = []
@@ -528,8 +590,19 @@ def main() -> None:
                     console.print(f"[dim]{usage.summary(active_backend())}[/]")
                 elif cmd == "/new":
                     session_prior = {}
+                    _view.topic = ""
+                    terminal.set_title(terminal.title_text())
                     console.print("[green]new topic[/] [dim]· the next question starts fresh instead of "
                                   "building on the last report[/]")
+                elif cmd == "/memory":
+                    _memory_cmd(arg)
+                elif cmd == "/remember":
+                    _remember(arg)
+                elif cmd == "/verbose":
+                    _view.verbose = (arg.lower() not in {"off", "0", "no"}) if arg else not _view.verbose
+                    console.print("[green]verbose on[/] [dim]· every tool call is listed during research[/]"
+                                  if _view.verbose else
+                                  "[green]verbose off[/] [dim]· one live line per research agent[/]")
                 elif cmd == "/resume":
                     try:
                         final = _resume(graph)

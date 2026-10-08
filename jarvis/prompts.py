@@ -9,7 +9,7 @@ heuristics, and a separate citation stage — condensed so small local models co
 CLARIFY_PROMPT = """You are Jarvis, a research planning assistant. Today is {date}. The user said:
 
 "{query}"
-{prior}
+{prior}{memory}
 Do three things:
 1) Classify intent and draft a SHORT provisional research brief (2-4 lines).
 2) Decide whether the request is ambiguous enough to warrant a FEW clarifying questions.
@@ -25,6 +25,7 @@ Reply with ONLY a JSON object:
 {{
   "intent": one of ["find_papers","pull_exact","read","find_datasets","general"],
   "follow_up": true | false,
+  "title": "<a 2-5 word topic name for this request, e.g. 'LLM unlearning methods'>",
   "brief": "<2-4 line provisional plan: what to find out and what kind of sources matter>",
   "query": "<a focused first search query>",
   "questions": [
@@ -59,7 +60,7 @@ Each subagent researches ONE facet in its own context with search tools, then re
 
 Original request: "{query}"
 Confirmed brief: {brief}
-{prior}
+{prior}{memory}
 STEP 1 — classify the query:
 - "straightforward": one focused question / fact lookup            -> 1 subagent
 - "depth_first": one topic needing several perspectives or methods -> 2-4 subagents, one per perspective
@@ -82,6 +83,7 @@ Reply with ONLY a JSON object:
   "rationale": "<one sentence on why this split>",
   "subagents": [
     {{
+      "title": "<a 3-6 word label for this facet, e.g. 'Influence-function unlearning'>",
       "objective": "<the ONE core thing this subagent must find out>",
       "key_questions": ["<1-3 concrete questions it must answer>"],
       "sub_query": "<a short, broad starting search query (2-6 words)>",
@@ -133,7 +135,7 @@ Source types to cover: {sources}
 Suggested tools: {tools}
 Report format: {output_format}
 Out of scope (another subagent covers it): {boundaries}
-Overall research brief, for context: {brief}"""
+Overall research brief, for context: {brief}{memory}"""
 
 SUBAGENT_FINISH = """Your tool budget is used up (or you stopped calling tools). Do not call any more
 tools. Write your final report for the lead now, in plain text, following the citation rules:
@@ -166,7 +168,7 @@ Today is {date}.
 
 User's request: "{query}"
 Research brief: {brief}
-{prior}
+{prior}{memory}
 Your subagents' reports (claims carry source ids like [S4]):
 {briefings}
 
@@ -205,4 +207,13 @@ PRIOR_FOR_REPORT = """
 This is a FOLLOW-UP to: "{query}". Findings from that run (you may build on and cite these;
 their [S#] ids are valid and listed in the catalog):
 {findings}
+"""
+
+# User memory (data/memory.md): standing preferences, given to every lead step, every subagent,
+# /ask and /read. Empty when the user has no notes.
+MEMORY_BLOCK = """
+USER MEMORY — standing preferences the user asked every agent to keep in mind. Follow them
+where they apply; if one conflicts with the current request, the request wins. They are not
+sources: never cite them or treat them as evidence.
+{memory}
 """
